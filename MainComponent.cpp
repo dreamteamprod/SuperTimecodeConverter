@@ -6233,6 +6233,17 @@ void MainComponent::timerCallback()
                 bpm100 = (uint32_t)(sharedStageLinQInput.getBPM(ep) * 100.0);
             }
 
+            // Fallback: for non-DJ sources (MTC / Art-Net / LTC / Generator /
+            // HippoNet), if the user has the audio BPM analyser running on
+            // this engine, send its detected BPM. Consoles like ChamSys read
+            // BPM from TCNet; Resolume ignores it so this is side-effect-free
+            // for existing setups. We deliberately don't fall back to audio
+            // BPM when src is a DJ source -- a CDJ reporting BPM=0 (paused,
+            // no track) should not be papered over with the audio analyser.
+            if (src != SrcType::ProDJLink && src != SrcType::StageLinQ
+                && eng.hasAudioBpm())
+                bpm100 = (uint32_t)(eng.getAudioBpm() * 100.0);
+
             auto info = eng.getActiveTrackInfo();
             durationMs = (info.durationSec > 0) ? (uint32_t)info.durationSec * 1000 : 0;
 

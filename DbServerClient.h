@@ -518,7 +518,11 @@ private:
     static constexpr int kMaxArtCacheEntries = 64;
     static constexpr int kMaxConnections    = 6;
     static constexpr int kReconnectCooldownMs = 5000;
-    static constexpr double kIdleTimeoutMs   = 30000.0;  // close connections idle for >30s
+    static constexpr double kIdleTimeoutMs   = 1000.0;   // close connections idle for >1s.
+                                                         // Holding dbserver sessions open for
+                                                         // longer correlates (per packet captures)
+                                                         // with NXS2 firmware entering its
+                                                         // "mute but TCP alive" state.
 
     // NXS2 extension constants for color waveform
     static constexpr uint32_t kNxs2ExtRequest  = 0x2c04;
@@ -581,6 +585,8 @@ private:
 
         bool isConnected() const { return socket && socket->isConnected(); }
 
+        /// Graceful close: send teardown, wait for CDJ to close its side, then
+        /// close our socket. Used for idle timeout and clean shutdown.
         void close()
         {
             if (socket && socket->isConnected())
@@ -588,7 +594,7 @@ private:
                 // Polite dbserver protocol teardown so the CDJ closes the connection
                 // from its side and properly releases its session resources.
                 // Format: magic | TxID=0xfffffffe | type=0x0100 | argc=0 | 12 zero tag bytes.
-                // Documented in djl-analysis (Deep-Symmetry); used by beat-link.
+                // Documented in the published Pro DJ Link protocol analysis.
                 static const uint8_t teardown[] = {
                     0x11, 0x87,0x23,0x49,0xae,        // magic field (0f-prefixed 4-byte)
                     0x11, 0xff,0xff,0xff,0xfe,        // TxID = 0xfffffffe
@@ -598,7 +604,42 @@ private:
                     0,0,0,0,0,0,0,0,0,0,0,0           // 12 zero tag bytes
                 };
                 socket->write(teardown, (int)sizeof(teardown));
+
+                // After teardown, the CDJ closes the connection from its end,
+                // so we can't read anything more. We wait briefly for that
+                // close so our local close() doesn't fire while the teardown
+                // bytes are still unacked, which on Windows/JUCE causes the
+                // kernel to emit RST instead of a clean shutdown.
+                // 200 ms is generous: the CDJ typically responds within 2 ms.
+                // We drain any pending bytes so the socket is empty when we
+                // close it, further reducing the chance of a reset.
+                if (socket->waitUntilReady(true, 200) == 1)
+                {
+                    uint8_t drain[256];
+                    while (socket->getRawSocketHandle() >= 0
+                           && socket->read(drain, sizeof(drain), false) > 0)
+                    {
+                        // keep draining until empty or connection gone
+                    }
+                }
             }
+            releaseSocket();
+        }
+
+        /// Abrupt close: skip the teardown. Used after a read failure, when
+        /// sending more bytes on a socket where a previous query went
+        /// unanswered could confuse the firmware further. The OS-level RST
+        /// that results is less of a concern here: the CDJ dbserver is
+        /// already in a bad state, and we need the connection gone so the
+        /// next query opens a fresh one.
+        void closeAbrupt()
+        {
+            releaseSocket();
+        }
+
+    private:
+        void releaseSocket()
+        {
             if (socket)
             {
                 socket->close();
@@ -920,6 +961,50 @@ private:
         return readExact(sock, out.getData(), (int)len, timeoutMs);
     }
 
+    /// Read a dbserver response; if the read fails, close the connection so
+    /// the next query opens a fresh socket instead of re-using a stale one.
+    ///
+    /// The common failure mode on NXS2 firmware (seen in packet captures)
+    /// is that a read times out even though the TCP socket is still alive.
+    /// Without this helper, a stream of failing queries would keep re-arming
+    /// lastActivityTime via getConnection(), so the idle closer would never
+    /// fire -- we would keep hammering a dbserver that has stopped responding.
+    /// Force the close inline here instead.
+    ///
+    /// We use closeAbrupt() because writing a teardown to a socket where the
+    /// firmware already failed to respond risks confusing it further -- the
+    /// previous query bytes never got a reply, adding more bytes on top
+    /// doesn't help.
+    ///
+    /// If expectedTxId is non-zero, the response txId is verified against it.
+    /// This catches a firmware-state-corruption case where the CDJ returns an
+    /// out-of-order response (answer to query N delivered when we expected
+    /// answer to query N+1) -- accepting such a response would attach
+    /// metadata to the wrong track.
+    static ResponseMessage readMessageOrInvalidate(PlayerConnection& conn, int timeoutMs,
+                                                   uint32_t expectedTxId = 0)
+    {
+        ResponseMessage msg;
+        if (!conn.socket) return msg;  // already closed by a prior failure
+        msg = readMessage(*conn.socket, timeoutMs);
+        if (!msg.ok)
+        {
+            DBG("DbServerClient: read failed, closing connection to " + conn.playerIP);
+            conn.closeAbrupt();
+            return msg;
+        }
+        if (expectedTxId != 0 && msg.txId != expectedTxId)
+        {
+            DBG("DbServerClient: unexpected txId 0x"
+                + juce::String::toHexString((int)msg.txId)
+                + " (expected 0x" + juce::String::toHexString((int)expectedTxId)
+                + ") -- connection is out of sync, closing " + conn.playerIP);
+            msg.ok = false;
+            conn.closeAbrupt();
+        }
+        return msg;
+    }
+
     //==========================================================================
     // CONNECTION MANAGEMENT
     //==========================================================================
@@ -1055,7 +1140,10 @@ private:
         // Step 4: Setup query context
         if (!setupQueryContext(*slot, ourPlayer))
         {
-            slot->close();
+            // Setup was rejected -- the CDJ won't accept our player identity.
+            // Sending a teardown on a socket the CDJ just refused would only
+            // add noise; close abruptly.
+            slot->closeAbrupt();
             slot->lastFailTime = juce::Time::getMillisecondCounterHiRes();
             return nullptr;
         }
@@ -1157,7 +1245,7 @@ private:
             return false;
         }
 
-        auto resp = readMessage(*conn.socket, kReadTimeoutMs);
+        auto resp = readMessageOrInvalidate(conn, kReadTimeoutMs, 0xFFFFFFFE);
         if (!resp.ok || resp.type != 0x4000)
         {
             DBG("DbServerClient: query context setup REJECTED (type=0x"
@@ -1198,7 +1286,7 @@ private:
             return meta;
 
         // Read response -- should be type 0x4000 with item count
-        auto resp = readMessage(*conn.socket, kReadTimeoutMs);
+        auto resp = readMessageOrInvalidate(conn, kReadTimeoutMs, currentTxId);
         if (!resp.ok || resp.type != 0x4000)
         {
             DBG("DbServerClient: metadata request failed for trackId=" + juce::String(trackId)
@@ -1209,6 +1297,19 @@ private:
         int itemCount = (int)resp.numArgs[1];
         if (itemCount <= 0 || resp.numArgs[1] == 0xFFFFFFFF)
             return meta;  // track not found
+
+        // Defensive cap on item count. For single-track metadata the count
+        // is typically 14-15 so this rarely applies, but if the firmware
+        // ever reports a bogus count we avoid a huge read loop that could
+        // push the CDJ into an odd state. 64 is a safe upper bound for
+        // NXS2 based on protocol behaviour.
+        static constexpr int kMenuBatchSize = 64;
+        if (itemCount > kMenuBatchSize)
+        {
+            DBG("DbServerClient: metadata item count " + juce::String(itemCount)
+                + " exceeds batch size, capping at " + juce::String(kMenuBatchSize));
+            itemCount = kMenuBatchSize;
+        }
 
         // Step 2: Render menu (type 0x3000) to get actual data
         uint32_t renderTxId = conn.txId++;
@@ -1226,14 +1327,14 @@ private:
             return meta;
 
         // Read header (type 0x4001)
-        auto header = readMessage(*conn.socket, kReadTimeoutMs);
+        auto header = readMessageOrInvalidate(conn, kReadTimeoutMs, renderTxId);
         if (!header.ok || header.type != 0x4001)
             return meta;
 
         // Read menu items (type 0x4101 each)
         for (int i = 0; i < itemCount; i++)
         {
-            auto item = readMessage(*conn.socket, kReadTimeoutMs);
+            auto item = readMessageOrInvalidate(conn, kReadTimeoutMs);
             if (!item.ok) break;
             if (item.type != 0x4101) break;
 
@@ -1296,7 +1397,7 @@ private:
         }
 
         // Read footer (type 0x4201)
-        auto footer = readMessage(*conn.socket, kReadTimeoutMs);
+        auto footer = readMessageOrInvalidate(conn, kReadTimeoutMs);
         // Footer is optional to verify -- some CDJs may differ
         (void)footer;
 
@@ -1328,7 +1429,7 @@ private:
         }
 
         // Response: type 0x4002 with blob containing JPEG data
-        auto resp = readMessage(*conn.socket, kReadTimeoutMs);
+        auto resp = readMessageOrInvalidate(conn, kReadTimeoutMs, currentTxId);
         if (!resp.ok)
         {
             DBG("DbServerClient: artwork response read failed");
@@ -1435,7 +1536,7 @@ private:
             return {};
         }
 
-        auto resp = readMessage(*conn.socket, kReadTimeoutMs);
+        auto resp = readMessageOrInvalidate(conn, kReadTimeoutMs, txId);
         if (!resp.ok || resp.type == 0x4003)
             return {};
         if (resp.argCount < 3 || resp.numArgs[2] == 0)
@@ -1593,7 +1694,7 @@ private:
         if (conn.socket->write(reqMsg.getData(), (int)reqMsg.getSize()) != (int)reqMsg.getSize())
             return {};
 
-        auto resp = readMessage(*conn.socket, kReadTimeoutMs);
+        auto resp = readMessageOrInvalidate(conn, kReadTimeoutMs, txId);
         if (!resp.ok || resp.type == 0x4003)
         {
             DBG("DbServerClient: beat grid response failed -- ok=" + juce::String((int)resp.ok)
@@ -1717,7 +1818,7 @@ private:
         if (conn.socket->write(reqMsg.getData(), (int)reqMsg.getSize()) != (int)reqMsg.getSize())
             return {};
 
-        auto resp = readMessage(*conn.socket, kReadTimeoutMs);
+        auto resp = readMessageOrInvalidate(conn, kReadTimeoutMs, txId);
         if (!resp.ok || resp.type == 0x4003) return {};
         if (resp.argCount < 3 || resp.numArgs[2] == 0) return {};
 
@@ -1806,7 +1907,7 @@ private:
         if (conn.socket->write(reqMsg.getData(), (int)reqMsg.getSize()) != (int)reqMsg.getSize())
             return {};
 
-        auto resp = readMessage(*conn.socket, kReadTimeoutMs);
+        auto resp = readMessageOrInvalidate(conn, kReadTimeoutMs, txId);
         if (!resp.ok || resp.type == 0x4003)
         {
             DBG("DbServerClient: song structure response failed -- ok=" + juce::String((int)resp.ok)
@@ -1951,7 +2052,7 @@ private:
                                         { dmst, trackId, kMagicPCO2, kMagicTXE });
             if (conn.socket->write(reqMsg.getData(), (int)reqMsg.getSize()) == (int)reqMsg.getSize())
             {
-                auto resp = readMessage(*conn.socket, kReadTimeoutMs);
+                auto resp = readMessageOrInvalidate(conn, kReadTimeoutMs, txId);
                 if (resp.ok && resp.type != 0x4003 && resp.argCount >= 3 && resp.numArgs[2] != 0)
                 {
                     auto blob = extractBlob(resp);
@@ -1986,7 +2087,7 @@ private:
                                         { dmst, trackId, kMagicPCOB, kMagicTXE });
             if (conn.socket->write(reqMsg.getData(), (int)reqMsg.getSize()) == (int)reqMsg.getSize())
             {
-                auto resp = readMessage(*conn.socket, kReadTimeoutMs);
+                auto resp = readMessageOrInvalidate(conn, kReadTimeoutMs, txId);
                 if (resp.ok && resp.type != 0x4003 && resp.argCount >= 3 && resp.numArgs[2] != 0)
                 {
                     auto blob = extractBlob(resp);
@@ -2291,7 +2392,10 @@ private:
                         if (conn.playerIP == ip)
                         {
                             DBG("DbServerClient: closing connection to lost player " + ip);
-                            conn.close();
+                            // Player is off the network -- teardown has nowhere
+                            // to go and waitUntilReady would block for 200ms
+                            // waiting for a close signal that will never arrive.
+                            conn.closeAbrupt();
                         }
                     }
                 }
