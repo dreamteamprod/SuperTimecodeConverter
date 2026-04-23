@@ -1413,14 +1413,47 @@ public:
                     //   END_TRACK: CDJ freezes actualSpeed (never ramps to 0).
                     //     playState == END_TRACK tells us directly -> force inactive.
                     //   NO_TRACK/LOADING/SEEKING: no useful timecode -> inactive.
+                    //
+                    // Model-specific wrinkle (NXS2 and older, CDJ mode):
+                    //   These players have NO deceleration ramp in CDJ mode --
+                    //   pressing pause clears the PLAYING flag (F byte bit 0x40)
+                    //   instantly, while actualSpeed remains frozen at its last
+                    //   value (e.g. 1.0025x, the pitch-fader setting).  The
+                    //   speed-only gate would keep sourceActive=true forever and
+                    //   LTC would continue streaming while the disc is paused.
+                    //
+                    //   CDJ-3000 uses a ~4-5s deceleration ramp even in CDJ mode,
+                    //   so its actualSpeed decays to zero naturally and the speed
+                    //   gate closes on its own.  Applying the flag gate there
+                    //   would cut LTC at the start of the ramp -- we must not.
+                    //
+                    //   Vinyl-mode pause on NXS2 briefly drops actualSpeed to 0
+                    //   for ~200-400ms before the flag clears, so the speed gate
+                    //   closes first -- the additional flag gate is harmless.
+                    //
+                    //   Decision: for non-3000 players, require BOTH speed above
+                    //   threshold AND the F-bit PLAYING flag set.  Beat-link
+                    //   treats this F bit as the authoritative playing signal
+                    //   in CdjStatus.isPlaying().
                     bool pdlHasData = sharedProDJLink->hasTimecodeData(ep);
                     double speed = (pll.actualSpeed > pll.kDeadZone)
                                  ? pll.actualSpeed
                                  : std::abs(pll.smoothVelocity);
 
                     bool wasActive = sourceActive;
+
+                    // Model-aware playing check.  CDJ-3000 ramp decays speed on
+                    // pause, so speed alone is enough.  Everything else needs
+                    // the F-flag to discriminate pause-with-frozen-speed from
+                    // real playback.
+                    bool motorGateOpen = true;
+                    const juce::String model = sharedProDJLink->getPlayerModel(ep);
+                    if (!model.contains("3000"))
+                        motorGateOpen = sharedProDJLink->isPlayingFlagSet(ep);
+
                     sourceActive = pdlRx && pdlHasData
                                 && (speed >= PlayheadPLL::kMinEncodingPitch)
+                                && motorGateOpen
                                 && !isEOT
                                 && isOnAirGateOpen();
 

@@ -918,13 +918,38 @@ private:
         // 5. Tags blob (always 12 bytes inside a blob field)
         auto tagsField = readField(sock, timeoutMs);
         if (!tagsField.ok) return msg;
-        // Tags blob data is discarded -- we don't need it because each argument
-        // field is self-typed via its leading type byte (0x0F/0x10/0x11/0x14/0x26).
-        // The tag bytes in the header are redundant per the protocol analysis.
+        // Capture the tag bytes -- we use them below to apply the same
+        // zero-length-blob protection beat-link's Message.read() implements.
+        // Without this, a CDJ that responds with argTag=3 (blob) preceded by
+        // a 0-length argument would cause us to consume bytes from the next
+        // argument instead, desynchronizing the stream.
+        const uint8_t* tagBytes = static_cast<const uint8_t*>(tagsField.blobData.getData());
+        int tagsAvailable = (int)tagsField.blobData.getSize();
+        if (tagsAvailable > 12) tagsAvailable = 12;
 
         // Read arguments -- field type byte tells us whether it's int, string, or blob
+        FieldResult lastArg;
         for (int i = 0; i < (int)msg.argCount && i < 12; i++)
         {
+            // Beat-link Message.read() applies this safety check: when the
+            // header says argument i is a binary blob (tag 0x03) but the
+            // immediately preceding argument was a 4-byte int with value 0
+            // (i.e. blob length = 0), don't try to read a zero-length blob
+            // field from the wire -- some firmware paths emit nothing in
+            // that position and the next byte already belongs to argument
+            // i+1.  Reading would consume the next arg's type byte and
+            // misalign the rest of the message.
+            if (i > 0 && i < tagsAvailable && tagBytes[i] == 0x03
+                && lastArg.ok && lastArg.type == 0x11
+                && lastArg.numericValue == 0)
+            {
+                msg.numArgs[i] = 0;  // blobArgs[i] stays empty
+                lastArg = FieldResult{};
+                lastArg.type = 0x14;  // synthesised blob, length 0
+                lastArg.ok = true;
+                continue;
+            }
+
             auto arg = readField(sock, timeoutMs);
             if (!arg.ok) return msg;
             msg.numArgs[i] = arg.numericValue;
@@ -932,6 +957,7 @@ private:
                 msg.strArgs[i] = arg.stringValue;
             if (arg.type == 0x14 && arg.blobData.getSize() > 0)
                 msg.blobArgs[i] = std::move(arg.blobData);
+            lastArg = arg;
         }
 
         msg.ok = true;
@@ -1506,6 +1532,15 @@ private:
         if (result.entryCount > 0)
             return result;
 
+        // The first attempt may have closed the socket via closeAbrupt() -- e.g.
+        // the CDJ returned an out-of-order response (NXS2 firmware sometimes
+        // delivers a stale 0x4e02 reply when we asked for 0x4f02), or any read
+        // failure.  Verify the connection survived before dispatching the
+        // fallback; otherwise queryOneWaveformFormat would dereference a null
+        // socket.
+        if (!conn.isConnected())
+            return {};
+
         // Fallback: try the other format (covers unknown models, CDJ-3000X, etc.)
         DBG("DbServerClient: primary waveform format failed, trying fallback");
         return queryOneWaveformFormat(conn, slot, trackType, trackId,
@@ -1517,6 +1552,13 @@ private:
         PlayerConnection& conn, uint8_t slot, uint8_t trackType,
         uint32_t trackId, uint8_t ourPlayer, bool threeBand)
     {
+        // Defensive: a previous query in the same processRequest() pass may
+        // have invalidated this connection (closeAbrupt() on read failure or
+        // txId mismatch).  Without this check, conn.socket->write() below
+        // would dereference null.
+        if (!conn.isConnected())
+            return {};
+
         uint32_t dmst = makeDMST(ourPlayer, 0x01, slot, trackType);
         uint32_t txId = conn.txId++;
 
@@ -1792,6 +1834,15 @@ private:
                                             ourPlayer, threeBandFirst);
         if (result.entryCount > 0) return result;
 
+        // The first attempt may have closed the socket via closeAbrupt() -- e.g.
+        // the CDJ returned an out-of-order response (NXS2 firmware sometimes
+        // delivers a stale 0x4e02 reply when we asked for 0x4f02), or any read
+        // failure.  Verify the connection survived before dispatching the
+        // fallback; otherwise queryOneDetailFormat would dereference a null
+        // socket.
+        if (!conn.isConnected())
+            return {};
+
         // Fallback to other format
         DBG("DbServerClient: primary detail format failed, trying fallback");
         return queryOneDetailFormat(conn, slot, trackType, trackId,
@@ -1802,6 +1853,13 @@ private:
         PlayerConnection& conn, uint8_t slot, uint8_t trackType,
         uint32_t trackId, uint8_t ourPlayer, bool threeBand)
     {
+        // Defensive: a previous query in the same processRequest() pass may
+        // have invalidated this connection (closeAbrupt() on read failure or
+        // txId mismatch).  Without this check, conn.socket->write() below
+        // would dereference null.
+        if (!conn.isConnected())
+            return {};
+
         uint32_t dmst = makeDMST(ourPlayer, 0x01, slot, trackType);
         uint32_t txId = conn.txId++;
 

@@ -215,6 +215,17 @@ private:
     DbServerClient sharedDbClient;        // shared across all engines (Phase 2)
     TCNetOutput    sharedTcnetOutput;     // shared TCNet timecode broadcast
     juce::String   tcnetArtworkKey[TCNetOutput::kMaxLayers];  // track key per layer for artwork change detection
+    juce::String   tcnetWaveformKey[TCNetOutput::kMaxLayers]; // track key per layer for waveform/beatgrid change detection
+
+    // Per-layer anchor state for synthetic beat counter. See the loop in
+    // timerCallback() that feeds TCNet for the rationale.
+    struct TcnetBeatState
+    {
+        uint32_t anchorPlayheadMs = 0;
+        double   beatAccum        = 0.0;
+        bool     valid            = false;
+    };
+    TcnetBeatState tcnetBeatState[TCNetOutput::kMaxLayers];
 
     TimecodeEngine& currentEngine() { return *engines[(size_t)selectedEngine]; }
     const TimecodeEngine& currentEngine() const { return *engines[(size_t)selectedEngine]; }

@@ -75,10 +75,36 @@ namespace ProDJLink
     static constexpr int kBeatPort      = 50001;
     static constexpr int kStatusPort    = 50002;
 
-    // Keepalive packet types (byte 10)
-    static constexpr uint8_t kKeepAliveTypeHello  = 0x0a;
-    static constexpr uint8_t kKeepAliveTypeIP     = 0x02;
-    static constexpr uint8_t kKeepAliveTypeStatus = 0x06;
+    // Announcement-port packet types (byte 10) -- received on port 50000.
+    //
+    // There are two overlapping type-number namespaces on this port:
+    //
+    //   - Device lifecycle packets, documented in the published Pro DJ Link
+    //     protocol analysis: 0x00 / 0x02 / 0x04 / 0x05 / 0x08 / 0x0a.
+    //   - The standard keepalive (0x06) that every device broadcasts ~1 Hz
+    //     once it has finished claiming a number.
+    //
+    // Older STC builds treated 0x02 as an "IP keepalive" and read a player
+    // number out of it.  That was an incorrect classification: on port 50000,
+    // type 0x02 is a DEVICE_NUMBER_CLAIM_STAGE_2 packet from a CDJ that is
+    // still negotiating its number -- the byte at offset 0x2e is the number
+    // it is *trying to claim*, not a stable assignment.  Registering the
+    // device as "discovered" from that packet made us show the player as
+    // online for the ~1 s claim window before the real keepalive arrived.
+    //
+    // We now only register devices from the 0x06 keepalive, and treat the
+    // other types as announcement-lifecycle events used for diagnostics.
+    static constexpr uint8_t kKeepAliveTypeClaimStage1 = 0x00;  // CDJ starting claim, bursts at 300 ms
+    static constexpr uint8_t kKeepAliveTypeClaimStage2 = 0x02;  // claim-byte at offset 0x2e
+    static constexpr uint8_t kKeepAliveTypeClaimStage3 = 0x04;  // claim-byte at offset 0x24
+    static constexpr uint8_t kKeepAliveTypeStatus      = 0x06;  // standard 1 Hz keepalive
+    static constexpr uint8_t kKeepAliveTypeInUse       = 0x08;  // device-number-in-use defense
+    static constexpr uint8_t kKeepAliveTypeHello       = 0x0a;  // initial Hello
+
+    // Legacy alias -- older code referenced "kKeepAliveTypeIP" believing 0x02
+    // was an IP-style keepalive.  Kept as an alias to avoid breaking other TUs
+    // that may still use it, but nothing new should reference this name.
+    static constexpr uint8_t kKeepAliveTypeIP     = kKeepAliveTypeClaimStage2;
 
     // Beat packet types (byte 10)
     static constexpr uint8_t kBeatTypeBeat        = 0x28;
@@ -1051,6 +1077,20 @@ public:
         return (ps == ProDJLink::kPlayPlaying || ps == ProDJLink::kPlayLooping);
     }
 
+    /// True if the status-flag PLAYING bit is set (F byte, bit 0x40).
+    ///
+    /// This is the authoritative "is the motor turning the disc" signal per
+    /// documented reference implementations.  The playState enum lags by up
+    /// to ~500ms during vinyl-mode pause ramps (P still reports PLAYING while
+    /// F has already cleared the bit), so this accessor is what source-active
+    /// gating should use on non-CDJ-3000 models -- see TimecodeEngine below.
+    bool isPlayingFlagSet(int playerNum) const
+    {
+        int idx = playerNum - 1;
+        if (idx < 0 || idx >= ProDJLink::kMaxPlayers) return false;
+        return players[idx].isPlaying.load(std::memory_order_relaxed);
+    }
+
     /// Track length in seconds
     uint32_t getTrackLengthSec(int playerNum) const
     {
@@ -1831,17 +1871,85 @@ private:
 
         uint8_t type = data[10];
 
-        // Only process type_status (0x06) -- the standard keepalive
-        if (type != ProDJLink::kKeepAliveTypeStatus && type != ProDJLink::kKeepAliveTypeIP)
+        // Device-claim diagnostics -- these are the announcement-lifecycle
+        // packets a CDJ broadcasts while it is negotiating a number on the
+        // network.  We do not register devices from these (their number is
+        // not yet stable); we only observe them, log them, and flag any
+        // claim that collides with an identity we are using.
+        //
+        // A full beat-link-style implementation would respond with a
+        // DEVICE_NUMBER_IN_USE (type 0x08) packet to defend our assigned
+        // number.  That emission path is intentionally not implemented yet
+        // -- it needs hardware validation that we do not have, and STC's
+        // own identities (player 5 on the 95 B keepalive, 0xC1 / 0xF9 on
+        // the 54 B bridge keepalive) do not collide with any legal CDJ
+        // number (1-6), so in practice a collision would require another
+        // bridge on the network or a misconfigured device.  For now we
+        // surface the event in the log so operators can see it.
+        if (type == ProDJLink::kKeepAliveTypeClaimStage1
+            || type == ProDJLink::kKeepAliveTypeClaimStage2
+            || type == ProDJLink::kKeepAliveTypeClaimStage3
+            || type == ProDJLink::kKeepAliveTypeInUse
+            || type == ProDJLink::kKeepAliveTypeHello)
+        {
+            // Claim byte offset varies by stage (per documented protocol):
+            //   stage 2 (0x02): byte at offset 0x2e (46)
+            //   stage 3 (0x04): byte at offset 0x24 (36)
+            //   stage 1 (0x00): number not yet chosen
+            uint8_t claimingNumber = 0;
+            if (type == ProDJLink::kKeepAliveTypeClaimStage2 && len > 0x2e)
+                claimingNumber = data[0x2e];
+            else if (type == ProDJLink::kKeepAliveTypeClaimStage3 && len > 0x24)
+                claimingNumber = data[0x24];
+
+            const bool collidesWithUs =
+                   claimingNumber != 0
+                && (claimingNumber == uint8_t(vCDJPlayerNumber)
+                    || claimingNumber == 0xC0
+                    || claimingNumber == 0xC1
+                    || claimingNumber == 0xF9);
+            (void)collidesWithUs;
+
+#if JUCE_DEBUG
+            const char* stageName =
+                  type == ProDJLink::kKeepAliveTypeClaimStage1 ? "CLAIM_STAGE_1"
+                : type == ProDJLink::kKeepAliveTypeClaimStage2 ? "CLAIM_STAGE_2"
+                : type == ProDJLink::kKeepAliveTypeClaimStage3 ? "CLAIM_STAGE_3"
+                : type == ProDJLink::kKeepAliveTypeInUse       ? "IN_USE_DEFENSE"
+                :                                                "HELLO";
+            DBG("ProDJLink: announcement " << stageName
+                << " from " << sender
+                << (claimingNumber ? (" claiming player " + juce::String((int)claimingNumber)) : juce::String())
+                << (collidesWithUs ? " -- COLLISION WITH OUR IDENTITY" : juce::String()));
+#endif
+            return;  // do not register the device yet; wait for keepalive (0x06)
+        }
+
+        // Everything below is for the stable keepalive (0x06).  Ignore any
+        // other type byte we do not explicitly recognise (e.g. type 0x05).
+        if (type != ProDJLink::kKeepAliveTypeStatus)
             return;
 
         pktCountKeepalive.fetch_add(1, std::memory_order_relaxed);
 
         uint8_t pn = 0;
-        if (type == ProDJLink::kKeepAliveTypeStatus && len >= 54)
+        if (len >= 54)
             pn = data[36];  // player_number in content
-        else if (type == ProDJLink::kKeepAliveTypeIP && len >= 48)
-            pn = data[46];  // player_number at different offset in type_ip
+
+        // Identity-collision diagnostic: if someone else advertises a stable
+        // keepalive for a number we are using, log it.  We only observe;
+        // active defense is not implemented (see note above).
+        if (pn != 0
+            && (pn == uint8_t(vCDJPlayerNumber) || pn == 0xC0 || pn == 0xC1 || pn == 0xF9)
+            && sender != bindIp)
+        {
+#if JUCE_DEBUG
+            DBG("ProDJLink: another device at " << sender
+                << " is keepalive-advertising player number "
+                << juce::String((int)pn)
+                << " -- potential conflict with our identity");
+#endif
+        }
 
         if (pn == 0 || pn == uint8_t(vCDJPlayerNumber) || pn == 0xC0 || pn == 0xC1 || pn == 0xF9) return;  // ignore self + bridge identities
 

@@ -6204,14 +6204,29 @@ void MainComponent::timerCallback()
             auto& eng = *engines[(size_t)i];
             if (!eng.isOutputTcnetEnabled()) continue;
 
-            int layer = eng.getTcnetLayer();  // 0-3
-            layerUsed[layer] = true;
+            int layer = eng.getTcnetLayer();  // 0-3, user-configured per engine
 
             auto src = eng.getActiveInput();
             int ep = eng.getEffectivePlayer();
+
+            // Layer assignment: respect the user's per-engine UI choice
+            // (cmbTcnetLayer combobox, value 1-4). The user knows their setup
+            // best -- they can pick distinct layers for distinct engines so
+            // they don't collide. We DO NOT override the layer based on the
+            // current source; switching ProDJLink<->Generator on the same
+            // engine keeps the same Layer ID, which means MagicQ sees a
+            // continuous identity instead of the master jumping around.
+            //
+            // SyncMaster is computed below from the actual source so that
+            // LayerID == SyncMaster (the MagicQ coherence check) holds:
+            //   - DJ source: SyncMaster = layer + 1 (matches the chosen layer)
+            //   - Non-DJ source: SyncMaster = layer + 1 (engine is its own master)
+            layerUsed[layer] = true;
+
             // Fader for Resolume opacity: real DJM/Denon fader value, 255 for non-DJ sources
             uint8_t onAirFader = 255;
             uint8_t beatInBar = 0;
+            uint32_t beatNumber = 0;
             uint32_t durationMs = 0;
             uint32_t bpm100 = 0;
 
@@ -6220,6 +6235,7 @@ void MainComponent::timerCallback()
                 if (sharedProDJLinkInput.hasMixerFaderData())
                     onAirFader = sharedProDJLinkInput.getChannelFader(ep);
                 beatInBar = sharedProDJLinkInput.getBeatInBar(ep);
+                beatNumber = sharedProDJLinkInput.getBeatCount(ep);
                 bpm100 = (uint32_t)(sharedProDJLinkInput.getBPM(ep) * 100.0);
             }
             else if (src == SrcType::StageLinQ && sharedStageLinQInput.getIsRunning())
@@ -6244,8 +6260,122 @@ void MainComponent::timerCallback()
                 && eng.hasAudioBpm())
                 bpm100 = (uint32_t)(eng.getAudioBpm() * 100.0);
 
+            // Synthesize beat marker and beat number from playhead + BPM when
+            // we don't have native beat info from a CDJ:
+            //  - For Pro DJ Link, the CDJ supplies both beatInBar and
+            //    beatCount directly, but only when it's actually sending
+            //    status packets. Use beatCount (beatNumber) as the signal
+            //    that we have real data: beatCount starts at 0 and only
+            //    advances on real CDJ packets. beatInBar has a default of
+            //    1 even without a connected CDJ, so it can't be trusted
+            //    as a "we have real data" check on its own.
+            //  - For StageLinQ, beatInBar comes from the deck but there's
+            //    no beatCount exposed -- synthesize beatNumber only.
+            //  - For non-DJ sources with audio BPM detected (Generator, MTC,
+            //    Art-Net, LTC), neither is available; synthesize both.
+            //
+            // Assumes 4/4 time with the first beat at playhead = 0. This won't
+            // align perfectly to the underlying audio (we have no reference)
+            // but gives consoles a steady beat pulse to drive effects from.
+            const bool haveNativeBeat = (src == SrcType::ProDJLink) && (beatNumber != 0);
+            uint32_t playheadForBeat = eng.getSmoothedPlayheadMs();
+            if (playheadForBeat == 0)
+            {
+                // getSmoothedPlayheadMs() only returns a value for DJ sources.
+                // For Generator / MTC / Art-Net / LTC, fall back to deriving
+                // the playhead from the engine's timecode (H:M:S:F).
+                auto tc  = eng.getOutputTimecode();
+                auto fps = eng.getEffectiveOutputFps();
+                double fms = 1000.0 / 30.0;
+                if      (fps == FrameRate::FPS_2398) fms = 1000.0 / 23.976;
+                else if (fps == FrameRate::FPS_24)   fms = 1000.0 / 24.0;
+                else if (fps == FrameRate::FPS_25)   fms = 1000.0 / 25.0;
+                else if (fps == FrameRate::FPS_2997) fms = 1000.0 / 29.97;
+                else if (fps == FrameRate::FPS_30)   fms = 1000.0 / 30.0;
+                playheadForBeat = (uint32_t)(tc.hours * 3600000
+                                           + tc.minutes * 60000
+                                           + tc.seconds * 1000
+                                           + tc.frames * fms);
+            }
+            if (bpm100 > 0 && !haveNativeBeat)
+            {
+                // Anchor-based beat counter. Computing beats as
+                // (playhead * bpm) / 60000 directly works but is extremely
+                // sensitive to tiny BPM jitter when the playhead is large
+                // (a 2-hour playhead with ±0.5 BPM jitter swings beatIdx
+                // by thousands, producing random-looking beat marker
+                // values). Instead we anchor at the first call and count
+                // beats as (elapsed_ms * bpm) / 60000 from that anchor --
+                // small BPM changes only affect rate, not absolute position.
+                auto& st = tcnetBeatState[layer];
+                if (!st.valid || playheadForBeat < st.anchorPlayheadMs)
+                {
+                    // First call on this layer, or playhead went backwards
+                    // (seek/loop). Re-anchor and emit beat 1.
+                    st.anchorPlayheadMs = playheadForBeat;
+                    st.beatAccum = 0.0;
+                    st.valid = true;
+                }
+                else
+                {
+                    uint32_t deltaMs = playheadForBeat - st.anchorPlayheadMs;
+                    st.anchorPlayheadMs = playheadForBeat;
+                    st.beatAccum += (double)deltaMs * (double)bpm100
+                                  / (60000.0 * 100.0);
+                }
+                uint64_t beatIdx = (uint64_t)st.beatAccum;
+                beatInBar  = (uint8_t)((beatIdx % 4) + 1);   // 1..4
+                beatNumber = (uint32_t)(beatIdx + 1);         // 1-based
+            }
+            else
+            {
+                // No BPM or native beat: invalidate anchor so the next time
+                // we get a BPM we re-anchor at the current position.
+                tcnetBeatState[layer].valid = false;
+            }
+
             auto info = eng.getActiveTrackInfo();
             durationMs = (info.durationSec > 0) ? (uint32_t)info.durationSec * 1000 : 0;
+
+            // SyncMaster always equals LayerID (= layer+1) so the MagicQ
+            // coherence check passes. The user's UI Layer choice IS the
+            // identity that the receiver tracks; we don't expose internal
+            // CDJ player numbering at the TCNet level.
+            uint8_t masterPlayerNum = (uint8_t)(layer + 1);
+
+            // Compute Track ID. For real CDJ sources use the rekordbox track
+            // ID so MagicQ correctly identifies the song. For non-CDJ sources
+            // synthesise an ID that encodes (layer, source type) so it
+            // changes when switching between sources -- this invalidates the
+            // ChamSys Beat Grid / Waveform cache from any previous source on
+            // the same layer (without it, MagicQ would hold onto stale data
+            // from a previous CDJ track when you switch to Generator).
+            uint32_t trackIdToSend = 0;
+            if (src == SrcType::ProDJLink && info.trackId != 0)
+            {
+                trackIdToSend = info.trackId;
+            }
+            else if (src == SrcType::StageLinQ && info.trackId != 0)
+            {
+                trackIdToSend = info.trackId;
+            }
+            else
+            {
+                // Synthesise: high bits encode source type so cache invalidates
+                // when source switches. Low bits encode layer so different
+                // engines stay distinct.
+                uint32_t srcTag = 0;
+                switch (src)
+                {
+                    case SrcType::SystemTime: srcTag = 0x10000000u; break;
+                    case SrcType::MTC:        srcTag = 0x20000000u; break;
+                    case SrcType::ArtNet:     srcTag = 0x30000000u; break;
+                    case SrcType::LTC:        srcTag = 0x40000000u; break;
+                    case SrcType::Hippotizer: srcTag = 0x50000000u; break;
+                    default: break;
+                }
+                trackIdToSend = srcTag | (uint32_t)(layer + 1);
+            }
 
             sharedTcnetOutput.setLayerFromEngine(
                 layer,
@@ -6257,7 +6387,10 @@ void MainComponent::timerCallback()
                 onAirFader,
                 beatInBar,
                 bpm100,
-                eng.getTcnetOutputOffsetMs());
+                eng.getTcnetOutputOffsetMs(),
+                beatNumber,
+                masterPlayerNum,
+                trackIdToSend);
 
             // Feed track metadata for Resolume unicast.
             // DJ sources: real artist + title from CDJ/Denon.
@@ -6275,7 +6408,7 @@ void MainComponent::timerCallback()
                     case SrcType::MTC:        artist = "MTC Input";        break;
                     case SrcType::ArtNet:      artist = "Art-Net Input";    break;
                     case SrcType::LTC:         artist = "LTC Input";        break;
-                    case SrcType::SystemTime:  artist = "System Time";      break;
+                    case SrcType::SystemTime:  artist = "Generator";        break;
                     case SrcType::ProDJLink:   artist = "Pro DJ Link";      break;
                     case SrcType::StageLinQ:   artist = "StageLinQ";        break;
                     case SrcType::Hippotizer:  artist = "HippoNet";       break;
@@ -6334,6 +6467,67 @@ void MainComponent::timerCallback()
                 {
                     tcnetArtworkKey[layer] = {};
                     sharedTcnetOutput.setLayerArtwork(layer, nullptr, 0);  // STC logo
+                }
+            }
+            // Feed waveform and beat grid from DbServer cache (ProDJLink only).
+            // StageLinQ has its own waveform/beatgrid API but isn't wired up here
+            // yet -- those layers get the BPM-synthesized fallback.
+            if (src == SrcType::ProDJLink && info.title.isNotEmpty() && info.trackId != 0)
+            {
+                juce::String wfKey = info.artist + "|" + info.title + "|wf";
+                if (info.durationSec > 0) wfKey += "|" + juce::String(info.durationSec);
+                if (tcnetWaveformKey[layer] != wfKey)
+                {
+                    tcnetWaveformKey[layer] = wfKey;
+                    auto playerIP = sharedProDJLinkInput.getPlayerIP(ep);
+                    auto md = sharedDbClient.getCachedMetadata(playerIP, info.trackId);
+
+                    // Waveform: prefer preview (hasWaveform).  Fallback to detail.
+                    if (md.hasWaveform())
+                    {
+                        sharedTcnetOutput.setLayerSmallWaveform(
+                            layer, md.waveformData.data(),
+                            md.waveformEntryCount, md.waveformBytesPerEntry);
+                    }
+                    else if (md.hasDetailWaveform())
+                    {
+                        sharedTcnetOutput.setLayerSmallWaveform(
+                            layer, md.detailData.data(),
+                            md.detailEntryCount, md.detailBytesPerEntry);
+                    }
+                    else
+                    {
+                        sharedTcnetOutput.setLayerSmallWaveform(layer, nullptr, 0, 0);
+                    }
+
+                    // Real beat grid if available.
+                    if (md.hasBeatGrid())
+                    {
+                        std::vector<uint16_t> nums;
+                        std::vector<uint32_t> times;
+                        nums.reserve(md.beatGrid.size());
+                        times.reserve(md.beatGrid.size());
+                        for (const auto& b : md.beatGrid)
+                        {
+                            nums.push_back(b.beatNumber);
+                            times.push_back(b.timeMs);
+                        }
+                        sharedTcnetOutput.setLayerBeatGrid(
+                            layer, nums.data(), times.data(), (int)nums.size());
+                    }
+                    else
+                    {
+                        sharedTcnetOutput.setLayerBeatGrid(layer, nullptr, nullptr, 0);
+                    }
+                }
+            }
+            else
+            {
+                if (tcnetWaveformKey[layer].isNotEmpty())
+                {
+                    tcnetWaveformKey[layer] = {};
+                    sharedTcnetOutput.setLayerSmallWaveform(layer, nullptr, 0, 0);
+                    sharedTcnetOutput.setLayerBeatGrid(layer, nullptr, nullptr, 0);
                 }
             }
         }
