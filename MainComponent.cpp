@@ -560,6 +560,139 @@ MainComponent::MainComponent()
             if (isShowLocked()) return;
             openGeneratorPresetEditor();
         };
+
+        // --- Generator audio playback (plays the audio file attached to a preset) ---
+        leftContent.addAndMakeVisible(btnGenAudioOut);
+        styleOutputToggle(btnGenAudioOut, juce::Colour(0xFFCC8844));
+        btnGenAudioOut.setVisible(false);
+        btnGenAudioOut.onClick = [this]
+        {
+            if (isShowLocked()) { btnGenAudioOut.setToggleState(!btnGenAudioOut.getToggleState(), juce::dontSendNotification); return; }
+            auto& eng = currentEngine();
+            if (btnGenAudioOut.getToggleState())
+                startCurrentGenAudio();
+            else
+                eng.stopGeneratorAudio();
+            updateDeviceSelectorVisibility();
+            resized();
+            saveSettings();
+        };
+
+        addLabelAndCombo(lblGenAudioDevice, cmbGenAudioDevice, "AUDIO PLAYBACK DEVICE:");
+        cmbGenAudioDevice.setVisible(false); lblGenAudioDevice.setVisible(false);
+        cmbGenAudioDevice.onChange = [this]
+        {
+            if (syncing) return;
+            if (isShowLockedRevert()) return;
+            if (cmbGenAudioDevice.getSelectedId() > 0
+                && cmbGenAudioDevice.getSelectedId() != kPlaceholderItemId
+                && btnGenAudioOut.getToggleState())
+            {
+                startCurrentGenAudio();
+            }
+            saveSettings();
+        };
+
+        addLabelAndCombo(lblGenAudioChannel, cmbGenAudioChannel, "AUDIO CHANNEL:");
+        cmbGenAudioChannel.setVisible(false); lblGenAudioChannel.setVisible(false);
+        cmbGenAudioChannel.onChange = [this]
+        {
+            if (syncing) return;
+            if (isShowLockedRevert()) return;
+            if (btnGenAudioOut.getToggleState() && cmbGenAudioDevice.getSelectedId() > 0
+                && cmbGenAudioDevice.getSelectedId() != kPlaceholderItemId)
+            {
+                startCurrentGenAudio();
+            }
+            saveSettings();
+        };
+
+        // File channel mode: which channel(s) of the audio FILE to use.
+        // Independent of the output routing -- handles the common case of
+        // industry-standard files with audio on L and LTC on R.
+        addLabelAndCombo(lblGenAudioFileMode, cmbGenAudioFileMode, "FILE CHANNELS:");
+        cmbGenAudioFileMode.addItem("Stereo (L+R)", 1);
+        cmbGenAudioFileMode.addItem("Left only",    2);
+        cmbGenAudioFileMode.addItem("Right only",   3);
+        cmbGenAudioFileMode.setSelectedId(1, juce::dontSendNotification);
+        cmbGenAudioFileMode.setVisible(false); lblGenAudioFileMode.setVisible(false);
+        cmbGenAudioFileMode.onChange = [this]
+        {
+            if (syncing) return;
+            // No need to reopen the device or reload the file -- the player
+            // reads this flag in the audio callback on every block, so the
+            // change takes effect immediately.
+            const int mode = cmbGenAudioFileMode.getSelectedId() - 1;   // 0..2
+            currentEngine().setGeneratorAudioFileChannelMode(mode);
+            saveSettings();
+        };
+
+        // Per-engine sample rate / buffer for the audio playback device.
+        // Default ("Default") = use the global preferred SR/Buffer; an explicit
+        // value overrides only this device.
+        addLabelAndCombo(lblGenAudioSR, cmbGenAudioSR, "SAMPLE RATE:");
+        cmbGenAudioSR.setVisible(false); lblGenAudioSR.setVisible(false);
+        populateGenAudioSampleRateCombo();
+        cmbGenAudioSR.onChange = [this]
+        {
+            if (syncing) return;
+            if (isShowLockedRevert()) return;
+            if (btnGenAudioOut.getToggleState()) startCurrentGenAudio();
+            saveSettings();
+        };
+
+        addLabelAndCombo(lblGenAudioBuffer, cmbGenAudioBuffer, "BUFFER SIZE:");
+        cmbGenAudioBuffer.setVisible(false); lblGenAudioBuffer.setVisible(false);
+        populateGenAudioBufferCombo();
+        cmbGenAudioBuffer.onChange = [this]
+        {
+            if (syncing) return;
+            if (isShowLockedRevert()) return;
+            if (btnGenAudioOut.getToggleState()) startCurrentGenAudio();
+            saveSettings();
+        };
+
+        // Volume slider: 0..1.5 linear (1=unity, 1.5=+3.5 dB headroom).
+        leftContent.addAndMakeVisible(lblGenAudioVolume);
+        styleLabel(lblGenAudioVolume, 9.0f);
+        lblGenAudioVolume.setText("VOLUME", juce::dontSendNotification);
+        lblGenAudioVolume.setVisible(false);
+        leftContent.addAndMakeVisible(sldGenAudioVolume);
+        sldGenAudioVolume.setSliderStyle(juce::Slider::LinearHorizontal);
+        sldGenAudioVolume.setRange(0.0, 1.5, 0.0);
+        sldGenAudioVolume.setValue(1.0, juce::dontSendNotification);
+        sldGenAudioVolume.setTextBoxStyle(juce::Slider::TextBoxRight, false, 50, 18);
+        sldGenAudioVolume.setNumDecimalPlacesToDisplay(2);
+        sldGenAudioVolume.setVisible(false);
+        sldGenAudioVolume.onValueChange = [this]
+        {
+            if (syncing) return;
+            currentEngine().setGeneratorAudioVolume((float) sldGenAudioVolume.getValue());
+            // Mirror the value in the floating waveform window if open.
+            if (genWaveformWindow != nullptr)
+            {
+                if (auto* content = dynamic_cast<GeneratorWaveformWindow*>(genWaveformWindow->getContentComponent()))
+                    content->setVolumeFromOutside((float) sldGenAudioVolume.getValue());
+            }
+        };
+        // Save settings only when the user finishes dragging, not on every
+        // intermediate value (avoids JSON write storms while sliding).
+        sldGenAudioVolume.onDragEnd = [this] { saveSettings(); };
+
+        leftContent.addAndMakeVisible(lblGenAudioStatus);
+        styleLabel(lblGenAudioStatus, 8.0f);
+        lblGenAudioStatus.setVisible(false);
+
+        // Mini waveform view (clickable -> opens the floating window).
+        leftContent.addAndMakeVisible(miniWaveform);
+        miniWaveform.setMode(GeneratorWaveformView::Mode::Mini);
+        miniWaveform.setVisible(false);
+        miniWaveform.onMiniClick = [this] { openGeneratorWaveformWindow(); };
+
+        leftContent.addAndMakeVisible(btnGenWaveformOpen);
+        btnGenWaveformOpen.setColour(juce::TextButton::buttonColourId, juce::Colour(0xFF444444));
+        btnGenWaveformOpen.setVisible(false);
+        btnGenWaveformOpen.onClick = [this] { openGeneratorWaveformWindow(); };
     }
 
     // --- OSC Input (generator remote control) ---
@@ -1584,7 +1717,7 @@ MainComponent::MainComponent()
     populateMidiAndNetworkCombos();
     loadAndApplyNonAudioSettings();
 
-    for (auto* cmb : { &cmbAudioInputDevice, &cmbAudioOutputDevice, &cmbThruOutputDevice })
+    for (auto* cmb : { &cmbAudioInputDevice, &cmbAudioOutputDevice, &cmbThruOutputDevice, &cmbGenAudioDevice })
         cmb->addItem("Scanning...", kPlaceholderItemId);
 
     startTimerHz(60);
@@ -1664,6 +1797,14 @@ MainComponent::~MainComponent()
         settings.genPresetBounds = juce::String(b.getX()) + " " + juce::String(b.getY())
                                  + " " + juce::String(b.getWidth()) + " " + juce::String(b.getHeight());
         delete genPresetWindow.getComponent();
+    }
+
+    if (genWaveformWindow != nullptr)
+    {
+        auto b = genWaveformWindow->getBounds();
+        settings.genWaveformBounds = juce::String(b.getX()) + " " + juce::String(b.getY())
+                                   + " " + juce::String(b.getWidth()) + " " + juce::String(b.getHeight());
+        delete genWaveformWindow.getComponent();
     }
 
     oscInputServer.stop();
@@ -1799,6 +1940,20 @@ void MainComponent::removeEngine(int index)
     engines[(size_t)index]->stopMtcInput();
     engines[(size_t)index]->stopArtnetInput();
     engines[(size_t)index]->stopLtcInput();
+
+    // Detach waveform views from the engine about to be deleted so we never
+    // dereference a dangling player/engine pointer in setAudioPlayer (called
+    // from the syncUIFromEngine() that follows the erase).
+    miniWaveform.setAudioPlayer(nullptr);
+    miniWaveform.setEngine(nullptr);
+    if (genWaveformWindow != nullptr)
+    {
+        if (auto* content = dynamic_cast<GeneratorWaveformWindow*>(genWaveformWindow->getContentComponent()))
+        {
+            content->setAudioPlayer(nullptr);
+            content->setEngine(nullptr);
+        }
+    }
 
     engines.erase(engines.begin() + index);
 
@@ -1970,6 +2125,19 @@ void MainComponent::syncUIFromEngine()
     syncing = true;
 
     auto& eng = currentEngine();
+
+    // Generator waveform: re-bind mini view (and floating window if open) to
+    // the now-selected engine's audio player and engine.
+    miniWaveform.setAudioPlayer(&eng.getGeneratorAudio());
+    miniWaveform.setEngine(&eng);
+    if (genWaveformWindow != nullptr)
+    {
+        if (auto* content = dynamic_cast<GeneratorWaveformWindow*>(genWaveformWindow->getContentComponent()))
+        {
+            content->setAudioPlayer(&eng.getGeneratorAudio());
+            content->setEngine(&eng);
+        }
+    }
 
     // Input buttons
     updateInputButtonStates();
@@ -2183,6 +2351,13 @@ void MainComponent::syncUIFromEngine()
         int thruOutIdx = findFilteredIndex(filteredOutputIndices, scannedAudioOutputs,
                                             es.thruOutputType, es.thruOutputDevice);
         cmbThruOutputDevice.setSelectedId(thruOutIdx >= 0 ? thruOutIdx + 1 : 0, juce::dontSendNotification);
+
+        int genAudioIdx = findFilteredIndex(filteredOutputIndices, scannedAudioOutputs,
+                                             es.generatorAudioType, es.generatorAudioDevice);
+        cmbGenAudioDevice.setSelectedId(genAudioIdx >= 0 ? genAudioIdx + 1 : 0, juce::dontSendNotification);
+
+        btnGenAudioOut.setToggleState(eng.isGeneratorAudioRunning() || es.generatorAudioEnabled,
+                                       juce::dontSendNotification);
     }
 
     // Audio channel selections based on running engines
@@ -2241,6 +2416,53 @@ void MainComponent::syncUIFromEngine()
             cmbThruOutputChannel.setSelectedId(kStereoItemId, juce::dontSendNotification);
         else
             cmbThruOutputChannel.setSelectedId(es.thruOutputChannel + 1, juce::dontSendNotification);
+    }
+
+    if (eng.isGeneratorAudioRunning())
+    {
+        populateGenAudioChannels();
+        int ch = eng.getGeneratorAudio().getSelectedChannel();
+        if (ch == -1)
+            cmbGenAudioChannel.setSelectedId(kStereoItemId, juce::dontSendNotification);
+        else if (ch >= 0)
+            cmbGenAudioChannel.setSelectedId(ch + 1, juce::dontSendNotification);
+    }
+    else if (selectedEngine < (int)settings.engines.size())
+    {
+        auto& es = settings.engines[(size_t)selectedEngine];
+        if (es.generatorAudioStereo)
+            cmbGenAudioChannel.setSelectedId(kStereoItemId, juce::dontSendNotification);
+        else
+            cmbGenAudioChannel.setSelectedId(es.generatorAudioChannel + 1, juce::dontSendNotification);
+    }
+
+    // Per-engine SR/Buffer/Volume for gen audio playback.
+    if (selectedEngine < (int)settings.engines.size())
+    {
+        const auto& es = settings.engines[(size_t)selectedEngine];
+        // SR combo: 0=Default, 44100=2, 48000=3, 88200=4, 96000=5
+        int srItem = 1;
+        if (es.generatorAudioSampleRate == 44100) srItem = 2;
+        else if (es.generatorAudioSampleRate == 48000) srItem = 3;
+        else if (es.generatorAudioSampleRate == 88200) srItem = 4;
+        else if (es.generatorAudioSampleRate == 96000) srItem = 5;
+        cmbGenAudioSR.setSelectedId(srItem, juce::dontSendNotification);
+
+        // Buffer combo: 0=Default, 64=2, 128=3, 256=4, 512=5, 1024=6, 2048=7
+        int bsItem = 1;
+        if (es.generatorAudioBufferSize == 64)   bsItem = 2;
+        else if (es.generatorAudioBufferSize == 128)  bsItem = 3;
+        else if (es.generatorAudioBufferSize == 256)  bsItem = 4;
+        else if (es.generatorAudioBufferSize == 512)  bsItem = 5;
+        else if (es.generatorAudioBufferSize == 1024) bsItem = 6;
+        else if (es.generatorAudioBufferSize == 2048) bsItem = 7;
+        cmbGenAudioBuffer.setSelectedId(bsItem, juce::dontSendNotification);
+
+        sldGenAudioVolume.setValue(es.generatorAudioVolume, juce::dontSendNotification);
+
+        // File channel mode (1=Stereo, 2=L only, 3=R only).
+        cmbGenAudioFileMode.setSelectedId(juce::jlimit(0, 2, es.generatorAudioFileChannelMode) + 1,
+                                           juce::dontSendNotification);
     }
 
     updateDeviceSelectorVisibility();
@@ -3162,6 +3384,45 @@ void MainComponent::startCurrentLtcOutput()
     }
 }
 
+void MainComponent::startCurrentGenAudio()
+{
+    auto& eng = currentEngine();
+    eng.stopGeneratorAudio();
+
+    auto entry = getSelectedGenAudioOutput();
+    if (entry.deviceName.isEmpty() && !filteredOutputIndices.isEmpty())
+    {
+        cmbGenAudioDevice.setSelectedId(1, juce::dontSendNotification);
+        entry = getSelectedGenAudioOutput();
+    }
+
+    int channel = getChannelFromCombo(cmbGenAudioChannel);
+
+    if (eng.startGeneratorAudio(entry.typeName, entry.deviceName, channel,
+                                 getGenAudioEffectiveSampleRate(),
+                                 getGenAudioEffectiveBufferSize()))
+    {
+        populateGenAudioChannels();
+
+        // Apply current volume (the slider is the source of truth).
+        eng.setGeneratorAudioVolume((float) sldGenAudioVolume.getValue());
+
+        // Audio file (if any) was already loaded into the player by the last
+        // activateGenPreset() call -- loadFile() works even when the device
+        // is closed, and attachReaderToTransport() (called from openDevice)
+        // re-binds the source to the transport.
+
+        // If the generator is currently playing, resume audio at the current
+        // position rather than waiting for the next play/stop transition.
+        if (eng.getGeneratorState() == TimecodeEngine::GeneratorState::Playing)
+        {
+            double pos = (eng.getGeneratorCurrentMs() - eng.getGeneratorStartMs()) / 1000.0;
+            eng.getGeneratorAudio().seekSeconds(juce::jmax(0.0, pos));
+            eng.getGeneratorAudio().play();
+        }
+    }
+}
+
 void MainComponent::updateCurrentOutputStates()
 {
     auto& eng = currentEngine();
@@ -3324,10 +3585,12 @@ void MainComponent::populateFilteredOutputDeviceCombos()
 {
     int savedOutId = cmbAudioOutputDevice.getSelectedId();
     int savedThruId = cmbThruOutputDevice.getSelectedId();
+    int savedGenAudioId = cmbGenAudioDevice.getSelectedId();
     auto filter = getOutputTypeFilter();
     filteredOutputIndices.clear();
     cmbAudioOutputDevice.clear(juce::dontSendNotification);
     cmbThruOutputDevice.clear(juce::dontSendNotification);
+    cmbGenAudioDevice.clear(juce::dontSendNotification);
 
     for (int i = 0; i < scannedAudioOutputs.size(); i++)
     {
@@ -3340,12 +3603,15 @@ void MainComponent::populateFilteredOutputDeviceCombos()
                                                 scannedAudioOutputs[i].typeName, false);
             cmbAudioOutputDevice.addItem(scannedAudioOutputs[i].displayName + marker, id);
             cmbThruOutputDevice.addItem(scannedAudioOutputs[i].displayName + marker, id);
+            cmbGenAudioDevice.addItem(scannedAudioOutputs[i].displayName + marker, id);
         }
     }
     if (savedOutId > 0 && savedOutId <= cmbAudioOutputDevice.getNumItems())
         cmbAudioOutputDevice.setSelectedId(savedOutId, juce::dontSendNotification);
     if (savedThruId > 0 && savedThruId <= cmbThruOutputDevice.getNumItems())
         cmbThruOutputDevice.setSelectedId(savedThruId, juce::dontSendNotification);
+    if (savedGenAudioId > 0 && savedGenAudioId <= cmbGenAudioDevice.getNumItems())
+        cmbGenAudioDevice.setSelectedId(savedGenAudioId, juce::dontSendNotification);
 }
 
 //==============================================================================
@@ -3461,6 +3727,30 @@ void MainComponent::populateBufferSizeCombo()
     cmbBufferSize.setSelectedId(1, juce::dontSendNotification);
 }
 
+void MainComponent::populateGenAudioSampleRateCombo()
+{
+    cmbGenAudioSR.clear(juce::dontSendNotification);
+    cmbGenAudioSR.addItem("Default", 1);
+    cmbGenAudioSR.addItem("44100", 2);
+    cmbGenAudioSR.addItem("48000", 3);
+    cmbGenAudioSR.addItem("88200", 4);
+    cmbGenAudioSR.addItem("96000", 5);
+    cmbGenAudioSR.setSelectedId(1, juce::dontSendNotification);
+}
+
+void MainComponent::populateGenAudioBufferCombo()
+{
+    cmbGenAudioBuffer.clear(juce::dontSendNotification);
+    cmbGenAudioBuffer.addItem("Default", 1);
+    cmbGenAudioBuffer.addItem("64",   2);
+    cmbGenAudioBuffer.addItem("128",  3);
+    cmbGenAudioBuffer.addItem("256",  4);
+    cmbGenAudioBuffer.addItem("512",  5);
+    cmbGenAudioBuffer.addItem("1024", 6);
+    cmbGenAudioBuffer.addItem("2048", 7);
+    cmbGenAudioBuffer.setSelectedId(1, juce::dontSendNotification);
+}
+
 double MainComponent::getPreferredSampleRate() const
 {
     switch (cmbSampleRate.getSelectedId())
@@ -3478,6 +3768,26 @@ int MainComponent::getPreferredBufferSize() const
         case 2: return 32; case 3: return 64; case 4: return 128;
         case 5: return 256; case 6: return 512; case 7: return 1024; case 8: return 2048;
         default: return 0;
+    }
+}
+
+double MainComponent::getGenAudioEffectiveSampleRate() const
+{
+    switch (cmbGenAudioSR.getSelectedId())
+    {
+        case 2: return 44100; case 3: return 48000;
+        case 4: return 88200; case 5: return 96000;
+        default: return getPreferredSampleRate();    // "Default" -> global
+    }
+}
+
+int MainComponent::getGenAudioEffectiveBufferSize() const
+{
+    switch (cmbGenAudioBuffer.getSelectedId())
+    {
+        case 2: return 64;   case 3: return 128;  case 4: return 256;
+        case 5: return 512;  case 6: return 1024; case 7: return 2048;
+        default: return getPreferredBufferSize();   // "Default" -> global
     }
 }
 
@@ -4040,6 +4350,38 @@ void MainComponent::applyAudioSettings()
                 }
             }
         }
+
+        // Generator audio playback (per-engine, optional)
+        if (es.generatorAudioEnabled)
+        {
+            int ch = es.generatorAudioStereo ? -1 : es.generatorAudioChannel;
+            // Per-engine SR/Buffer: 0 means "use global preferred".
+            const double sr = (es.generatorAudioSampleRate > 0) ? es.generatorAudioSampleRate
+                                                                : getPreferredSampleRate();
+            const int    bs = (es.generatorAudioBufferSize > 0) ? es.generatorAudioBufferSize
+                                                                : getPreferredBufferSize();
+            if (i == selectedEngine)
+            {
+                int genIdx = findFilteredIndex(filteredOutputIndices, scannedAudioOutputs,
+                                                es.generatorAudioType, es.generatorAudioDevice);
+                if (genIdx >= 0) cmbGenAudioDevice.setSelectedId(genIdx + 1, juce::dontSendNotification);
+                btnGenAudioOut.setToggleState(true, juce::dontSendNotification);
+
+                // Open with channel from settings -- combo isn't populated yet.
+                // syncUIFromEngine() (called next) will sync the combo selection.
+                eng.startGeneratorAudio(es.generatorAudioType, es.generatorAudioDevice, ch, sr, bs);
+                populateGenAudioChannels();
+            }
+            else if (!es.generatorAudioDevice.isEmpty())
+            {
+                eng.startGeneratorAudio(es.generatorAudioType, es.generatorAudioDevice, ch, sr, bs);
+            }
+        }
+        // Volume and file channel mode persist across audio-on/off toggles
+        // and apply even when the device is closed (they're atomic stores
+        // on the player; effect takes hold the moment playback resumes).
+        eng.setGeneratorAudioVolume(es.generatorAudioVolume);
+        eng.setGeneratorAudioFileChannelMode(es.generatorAudioFileChannelMode);
     }
 
     updateDeviceSelectorVisibility();
@@ -4165,6 +4507,30 @@ void MainComponent::flushSettings()
                 es.thruOutputChannel = es.thruOutputStereo ? 0 : (cmbThruOutputChannel.getSelectedId() - 1);
                 es.thruInputChannel = cmbThruInputChannel.getSelectedId() - 1;
 
+                // Generator audio playback device
+                es.generatorAudioEnabled = btnGenAudioOut.getToggleState();
+                auto genAudioEntry = getSelectedGenAudioOutput();
+                if (genAudioEntry.deviceName.isNotEmpty())
+                {
+                    es.generatorAudioDevice = genAudioEntry.deviceName;
+                    es.generatorAudioType   = genAudioEntry.typeName;
+                }
+                es.generatorAudioStereo  = (cmbGenAudioChannel.getSelectedId() == kStereoItemId);
+                es.generatorAudioChannel = es.generatorAudioStereo ? 0 : (cmbGenAudioChannel.getSelectedId() - 1);
+                es.generatorAudioVolume  = (float) sldGenAudioVolume.getValue();
+                es.generatorAudioFileChannelMode = juce::jlimit(0, 2, cmbGenAudioFileMode.getSelectedId() - 1);
+                // Per-engine SR/Buffer overrides; 0 = "Default" (use global).
+                {
+                    static const double srMap[] = { 0.0, 0.0, 44100, 48000, 88200, 96000 };
+                    static const int    bsMap[] = { 0,    0,   64,    128,   256,   512,  1024, 2048 };
+                    constexpr int srMapN = (int) (sizeof(srMap) / sizeof(srMap[0]));
+                    constexpr int bsMapN = (int) (sizeof(bsMap) / sizeof(bsMap[0]));
+                    const int srSel = cmbGenAudioSR.getSelectedId();
+                    const int bsSel = cmbGenAudioBuffer.getSelectedId();
+                    es.generatorAudioSampleRate = (srSel >= 0 && srSel < srMapN) ? srMap[srSel] : 0.0;
+                    es.generatorAudioBufferSize = (bsSel >= 0 && bsSel < bsMapN) ? bsMap[bsSel] : 0;
+                }
+
                 // Audio BPM device/channel
                 es.audioBpmEnabled = eng.isAudioBpmRunning();
                 if (eng.isAudioBpmRunning())
@@ -4233,6 +4599,20 @@ void MainComponent::flushSettings()
                 es.thruOutputStereo  = (ch == -1);
                 es.thruOutputChannel = (ch == -1) ? 0 : ch;
             }
+            // Generator audio playback (per-engine)
+            es.generatorAudioEnabled = eng.isGeneratorAudioRunning();
+            if (eng.isGeneratorAudioRunning())
+            {
+                es.generatorAudioDevice = eng.getGeneratorAudio().getCurrentDeviceName();
+                es.generatorAudioType   = eng.getGeneratorAudio().getCurrentTypeName();
+                int ch = eng.getGeneratorAudio().getSelectedChannel();
+                es.generatorAudioStereo  = (ch == -1);
+                es.generatorAudioChannel = (ch == -1) ? 0 : ch;
+            }
+            // Volume is per-engine and persists even when the audio device
+            // is closed, so the user does not lose their setting.
+            es.generatorAudioVolume = eng.getGeneratorAudioVolume();
+            es.generatorAudioFileChannelMode = eng.getGeneratorAudioFileChannelMode();
             // ArtNet interfaces preserved from last save when engine was selected
             es.trackMapEnabled = eng.isTrackMapEnabled();
             es.midiClockEnabled = eng.isMidiClockEnabled();
@@ -4373,6 +4753,14 @@ AudioDeviceEntry MainComponent::getSelectedThruOutput() const
     return {};
 }
 
+AudioDeviceEntry MainComponent::getSelectedGenAudioOutput() const
+{
+    int sel = cmbGenAudioDevice.getSelectedId() - 1;
+    if (sel >= 0 && sel < filteredOutputIndices.size())
+    { int realIdx = filteredOutputIndices[sel]; if (realIdx < scannedAudioOutputs.size()) return scannedAudioOutputs[realIdx]; }
+    return {};
+}
+
 //==============================================================================
 // CHANNEL HELPERS
 //==============================================================================
@@ -4429,6 +4817,19 @@ void MainComponent::populateThruOutputChannels()
     if (prev == kStereoItemId && n >= 2) cmbThruOutputChannel.setSelectedId(kStereoItemId, juce::dontSendNotification);
     else if (prev > 0 && prev <= n) cmbThruOutputChannel.setSelectedId(prev, juce::dontSendNotification);
     else cmbThruOutputChannel.setSelectedId(n >= 2 ? kStereoItemId : 1, juce::dontSendNotification);
+}
+
+void MainComponent::populateGenAudioChannels()
+{
+    auto& eng = currentEngine();
+    int prev = cmbGenAudioChannel.getSelectedId();
+    cmbGenAudioChannel.clear(juce::dontSendNotification);
+    int n = juce::jmax(2, eng.getGeneratorAudio().getChannelCount());
+    if (n >= 2) cmbGenAudioChannel.addItem("Ch 1 + Ch 2", kStereoItemId);
+    for (int i = 0; i < n; i++) cmbGenAudioChannel.addItem("Ch " + juce::String(i+1), i+1);
+    if (prev == kStereoItemId && n >= 2) cmbGenAudioChannel.setSelectedId(kStereoItemId, juce::dontSendNotification);
+    else if (prev > 0 && prev <= n) cmbGenAudioChannel.setSelectedId(prev, juce::dontSendNotification);
+    else cmbGenAudioChannel.setSelectedId(n >= 2 ? kStereoItemId : 1, juce::dontSendNotification);
 }
 
 void MainComponent::populateAudioBpmChannels()
@@ -4553,6 +4954,19 @@ void MainComponent::updateDeviceSelectorVisibility()
     cmbGenPreset.setVisible(showGenTransport);  lblGenPreset.setVisible(showGenTransport);
     btnGenPrev.setVisible(showGenTransport);    btnGenNext.setVisible(showGenTransport);
     btnGenGo.setVisible(showGenTransport);      btnGenPresetEdit.setVisible(showGenTransport);
+
+    // Generator audio playback (only visible in transport mode)
+    btnGenAudioOut.setVisible(showGenTransport);
+    bool showGenAudioConfig = showGenTransport && btnGenAudioOut.getToggleState();
+    cmbGenAudioDevice.setVisible(showGenAudioConfig);  lblGenAudioDevice.setVisible(showGenAudioConfig);
+    cmbGenAudioChannel.setVisible(showGenAudioConfig); lblGenAudioChannel.setVisible(showGenAudioConfig);
+    cmbGenAudioFileMode.setVisible(showGenAudioConfig); lblGenAudioFileMode.setVisible(showGenAudioConfig);
+    cmbGenAudioSR.setVisible(showGenAudioConfig);      lblGenAudioSR.setVisible(showGenAudioConfig);
+    cmbGenAudioBuffer.setVisible(showGenAudioConfig);  lblGenAudioBuffer.setVisible(showGenAudioConfig);
+    sldGenAudioVolume.setVisible(showGenAudioConfig);  lblGenAudioVolume.setVisible(showGenAudioConfig);
+    lblGenAudioStatus.setVisible(showGenAudioConfig);
+    miniWaveform.setVisible(showGenAudioConfig);
+    btnGenWaveformOpen.setVisible(showGenAudioConfig);
     btnOscIn.setVisible(showGenerator);
     bool showOscInConfig = showGenerator;
     cmbOscInputInterface.setVisible(showOscInConfig);  lblOscInputInterface.setVisible(showOscInConfig);
@@ -4862,6 +5276,53 @@ void MainComponent::updateStatusLabels()
         lblOutputThruStatus.setText(thruStatus, juce::dontSendNotification);
     }
 
+    // Generator audio playback status
+    if (btnGenAudioOut.getToggleState())
+    {
+        juce::String s;
+        if (eng.isGeneratorAudioRunning())
+        {
+            if (eng.hasGeneratorAudioFile())
+            {
+                auto fname = eng.getGeneratorAudioFile().getFileName();
+                if (eng.isGeneratorAudioPlaying())
+                    s = "PLAYING " + fname;
+                else
+                    s = "READY " + fname;
+            }
+            else
+            {
+                // Check if the currently selected preset has an audio path set
+                // but the file is missing on disk -- distinguish from "no file
+                // attached to this preset".  When the player has a load error
+                // recorded (e.g. unsupported format), surface that instead.
+                auto loadErr = eng.getGeneratorAudio().getLoadError();
+                if (loadErr.isNotEmpty())
+                {
+                    s = loadErr;
+                }
+                else
+                {
+                    auto presetName = cmbGenPreset.getText();
+                    auto* preset = presetName.isNotEmpty() ? settings.generatorPresets.find(presetName) : nullptr;
+                    if (preset != nullptr && preset->audioFilePath.isNotEmpty())
+                        s = "FILE NOT FOUND: " + juce::File(preset->audioFilePath).getFileName();
+                    else
+                        s = "DEVICE OPEN (no audio file)";
+                }
+            }
+        }
+        else
+        {
+            s = "DEVICE NOT OPEN";
+        }
+        lblGenAudioStatus.setText(s, juce::dontSendNotification);
+    }
+    else
+    {
+        lblGenAudioStatus.setText({}, juce::dontSendNotification);
+    }
+
     // Hippotizer output status
     if (eng.isOutputHippoEnabled())
     {
@@ -5025,6 +5486,16 @@ void MainComponent::activateGenPreset(const juce::String& name)
     eng.setGeneratorStartMs(startMs);
     eng.setGeneratorStopMs(stopMs);
 
+    // Push the preset's audio file (or empty for "no audio") to the engine.
+    // Done after generatorStop() so the previous file (if any) is cleanly
+    // released before the new one is loaded.
+    if (auto* preset = settings.generatorPresets.find(name))
+    {
+        juce::File audioFile = preset->audioFilePath.isNotEmpty()
+                                 ? juce::File(preset->audioFilePath) : juce::File();
+        eng.setGeneratorAudioFile(audioFile, preset->audioLoop);
+    }
+
     eng.generatorPlay();
     saveSettings();
 }
@@ -5043,9 +5514,22 @@ void MainComponent::loadGenPresetToFields(const juce::String& name)
     txtGenStartTC.setText(startNorm, false);
     txtGenStopTC.setText(stopNorm, false);
 
-    // Apply to engine (without starting playback)
+    // Apply to engine (without starting playback).  Audio file handling:
+    // if the engine is currently playing audio, we leave it alone -- changing
+    // the selection should not interrupt audio that is on air.  But if the
+    // engine is idle, we DO push the new audio file so the waveform view
+    // immediately reflects the selected preset (and is ready when the user
+    // hits GO).
     eng.setGeneratorStartMs(parseTimecodeToMs(preset->startTC, fps));
     eng.setGeneratorStopMs(parseTimecodeToMs(preset->stopTC, fps));
+
+    if (! eng.isGeneratorAudioPlaying())
+    {
+        juce::File audioFile = preset->audioFilePath.isNotEmpty()
+                                 ? juce::File(preset->audioFilePath) : juce::File();
+        eng.setGeneratorAudioFile(audioFile, preset->audioLoop);
+    }
+
     saveSettings();
 }
 
@@ -5154,6 +5638,12 @@ void MainComponent::setupOscInputServer()
                         eng.generatorStop();
                         eng.setGeneratorStartMs(parseTimecodeToMs(preset->startTC, fps));
                         eng.setGeneratorStopMs(parseTimecodeToMs(preset->stopTC, fps));
+
+                        // Audio file from the preset (empty path = no audio)
+                        juce::File audioFile = preset->audioFilePath.isNotEmpty()
+                                                 ? juce::File(preset->audioFilePath) : juce::File();
+                        eng.setGeneratorAudioFile(audioFile, preset->audioLoop);
+
                         eng.generatorPlay();
 
                         // Update UI if this is the selected engine
@@ -5261,6 +5751,92 @@ void MainComponent::openGeneratorPresetEditor()
     };
     win->setVisible(true);
     genPresetWindow = win;
+}
+
+//==============================================================================
+void MainComponent::openGeneratorWaveformWindow()
+{
+    if (genWaveformWindow != nullptr)
+    {
+        genWaveformWindow->toFront(true);
+        return;
+    }
+
+    auto* content = new GeneratorWaveformWindow();
+    content->setAudioPlayer(&currentEngine().getGeneratorAudio());
+    content->setEngine(&currentEngine());
+    content->setLockedFn([this] { return isShowLocked(); });
+
+    // PREV / NEXT route through the same combo the panel uses, so behaviour
+    // (loading the new preset's TC range and refreshing the waveform when
+    // idle) is identical regardless of which UI surface triggered it.
+    content->onPrev = [this] {
+        const int num = cmbGenPreset.getNumItems();
+        if (num == 0) return;
+        const int sel = cmbGenPreset.getSelectedId();
+        const int newSel = (sel <= 1) ? num : sel - 1;
+        cmbGenPreset.setSelectedId(newSel, juce::sendNotificationSync);
+    };
+    content->onNext = [this] {
+        const int num = cmbGenPreset.getNumItems();
+        if (num == 0) return;
+        const int sel = cmbGenPreset.getSelectedId();
+        const int newSel = (sel >= num) ? 1 : sel + 1;
+        cmbGenPreset.setSelectedId(newSel, juce::sendNotificationSync);
+    };
+    content->onEdit = [this] {
+        // Match the panel's EDIT button: blocked under Show Lock so a
+        // distracted operator cannot reshuffle presets mid-show.
+        if (isShowLocked()) return;
+        openGeneratorPresetEditor();
+    };
+    content->onVolumeChanged = [this](float v) {
+        // Mirror the panel slider so both UIs always agree.  setValue with
+        // dontSendNotification avoids re-firing onValueChange and the
+        // engine apply (already done by the window's slider directly).
+        sldGenAudioVolume.setValue(v, juce::dontSendNotification);
+        saveSettings();
+    };
+
+    struct FloatingWindow : juce::DocumentWindow
+    {
+        FloatingWindow(const juce::String& t, juce::Colour bg)
+            : DocumentWindow(t, bg, DocumentWindow::closeButton | DocumentWindow::maximiseButton) {}
+        void closeButtonPressed() override { if (onClose) onClose(); delete this; }
+        std::function<void()> onClose;
+    };
+
+    auto* win = new FloatingWindow("Generator Waveform", juce::Colour(0xFF12141A));
+    win->setContentOwned(content, true);
+    win->setUsingNativeTitleBar(false);
+    win->setTitleBarHeight(20);
+    win->setColour(juce::DocumentWindow::textColourId, juce::Colour(0xFF546E7A));
+    win->setResizable(true, true);
+    win->centreWithSize(content->getWidth(), content->getHeight());
+    if (settings.genWaveformBounds.isNotEmpty())
+    {
+        auto parts = juce::StringArray::fromTokens(settings.genWaveformBounds, " ", "");
+        if (parts.size() == 4)
+        {
+            auto b = juce::Rectangle<int>(parts[0].getIntValue(), parts[1].getIntValue(),
+                                           parts[2].getIntValue(), parts[3].getIntValue());
+            if (b.getWidth() >= 400 && b.getHeight() >= 180)
+            {
+                auto c = b.getCentre();
+                for (auto& d : juce::Desktop::getInstance().getDisplays().displays)
+                    if (d.totalArea.contains(c)) { win->setBounds(b); break; }
+            }
+        }
+    }
+    win->onClose = [this, win]()
+    {
+        auto b = win->getBounds();
+        settings.genWaveformBounds = juce::String(b.getX()) + " " + juce::String(b.getY())
+                                   + " " + juce::String(b.getWidth()) + " " + juce::String(b.getHeight());
+        saveSettings();
+    };
+    win->setVisible(true);
+    genWaveformWindow = win;
 }
 
 //==============================================================================
@@ -5593,6 +6169,48 @@ void MainComponent::resized()
         btnGenPrev.setBounds(presetRow.removeFromRight(22));
         presetRow.removeFromRight(2);
         cmbGenPreset.setBounds(presetRow);
+        leftPanel.removeFromTop(3);
+    }
+
+    // Generator audio playback toggle + device + channel
+    if (btnGenAudioOut.isVisible())
+    {
+        leftPanel.removeFromTop(2);
+        btnGenAudioOut.setBounds(leftPanel.removeFromTop(22));
+        leftPanel.removeFromTop(3);
+    }
+    if (cmbGenAudioDevice.isVisible())
+    {
+        layCombo(lblGenAudioDevice,  cmbGenAudioDevice,  leftPanel);
+        layCombo(lblGenAudioChannel, cmbGenAudioChannel, leftPanel);
+    }
+    if (cmbGenAudioFileMode.isVisible())
+    {
+        layCombo(lblGenAudioFileMode, cmbGenAudioFileMode, leftPanel);
+    }
+    if (cmbGenAudioSR.isVisible())
+    {
+        layCombo(lblGenAudioSR,     cmbGenAudioSR,     leftPanel);
+        layCombo(lblGenAudioBuffer, cmbGenAudioBuffer, leftPanel);
+    }
+    if (sldGenAudioVolume.isVisible())
+    {
+        // Single-row layout: small label + slider on the right of the same row.
+        auto row = leftPanel.removeFromTop(20);
+        lblGenAudioVolume.setBounds(row.removeFromLeft(70));
+        sldGenAudioVolume.setBounds(row);
+        leftPanel.removeFromTop(2);
+    }
+    if (lblGenAudioStatus.isVisible())
+    {
+        layStatus(lblGenAudioStatus, leftPanel);
+    }
+    if (miniWaveform.isVisible())
+    {
+        leftPanel.removeFromTop(3);
+        miniWaveform.setBounds(leftPanel.removeFromTop(48));
+        leftPanel.removeFromTop(3);
+        btnGenWaveformOpen.setBounds(leftPanel.removeFromTop(20));
         leftPanel.removeFromTop(3);
     }
 

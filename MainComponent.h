@@ -13,6 +13,8 @@
 #include "TrackMapEditor.h"
 #include "MixerMapEditor.h"
 #include "GeneratorPresetEditor.h"
+#include "GeneratorWaveformView.h"
+#include "GeneratorWaveformWindow.h"
 #include "OscInputServer.h"
 #include "NetworkUtils.h"
 #include "UpdateChecker.h"
@@ -316,6 +318,21 @@ private:
     juce::TextButton btnGenGo     { "GO" };
     juce::TextButton btnGenPresetEdit { "EDIT" };
 
+    // Generator audio playback (per-engine output device for preset audio files)
+    juce::ToggleButton btnGenAudioOut { "AUDIO PLAYBACK" };
+    juce::ComboBox   cmbGenAudioDevice;     juce::Label lblGenAudioDevice;
+    juce::ComboBox   cmbGenAudioChannel;    juce::Label lblGenAudioChannel;
+    juce::ComboBox   cmbGenAudioFileMode;   juce::Label lblGenAudioFileMode;
+    juce::ComboBox   cmbGenAudioSR;         juce::Label lblGenAudioSR;
+    juce::ComboBox   cmbGenAudioBuffer;     juce::Label lblGenAudioBuffer;
+    juce::Slider     sldGenAudioVolume;     juce::Label lblGenAudioVolume;
+    juce::Label      lblGenAudioStatus;
+
+    // Generator waveform: mini view embedded in the panel + button to open
+    // the floating window with the full waveform / transport / TC display.
+    GeneratorWaveformView miniWaveform;
+    juce::TextButton     btnGenWaveformOpen { "WAVEFORM" };
+
     // OSC Input (global, controls generator from external OSC sources)
     juce::ToggleButton btnOscIn { "OSC IN" };
     juce::ComboBox     cmbOscInputInterface;
@@ -425,6 +442,7 @@ private:
 
     juce::Component::SafePointer<juce::DocumentWindow> trackMapWindow;
     juce::Component::SafePointer<juce::DocumentWindow> genPresetWindow;
+    juce::Component::SafePointer<juce::DocumentWindow> genWaveformWindow;
     std::unique_ptr<CuePointEditorWindow> cuePointWindow;
     std::string cuePointTrackKey;  // key of the entry being edited (for dangling ref safety)
     juce::TextButton btnMixerMapEdit { "Mixer Map" };
@@ -574,9 +592,15 @@ private:
 
     void populateSampleRateCombo();
     void populateBufferSizeCombo();
+    void populateGenAudioSampleRateCombo();
+    void populateGenAudioBufferCombo();
     double getPreferredSampleRate() const;
-    int getPreferredBufferSize() const;
-    void restartAllAudioDevices();
+    int    getPreferredBufferSize() const;
+    /// Effective SR/Buffer for the Generator's audio playback device.
+    /// Returns the per-engine override if set, otherwise the global preferred.
+    double getGenAudioEffectiveSampleRate() const;
+    int    getGenAudioEffectiveBufferSize() const;
+    void   restartAllAudioDevices();
 
     int findFilteredIndex(const juce::Array<int>& filteredIndices,
                           const juce::Array<AudioDeviceEntry>& entries,
@@ -584,6 +608,7 @@ private:
     AudioDeviceEntry getSelectedAudioInput() const;
     AudioDeviceEntry getSelectedAudioOutput() const;
     AudioDeviceEntry getSelectedThruOutput() const;
+    AudioDeviceEntry getSelectedGenAudioOutput() const;
 
     // Engine-level start/stop (gathers params from UI, calls engine methods)
     void startCurrentMtcInput();
@@ -605,11 +630,13 @@ private:
     void startCurrentMtcOutput();
     void startCurrentArtnetOutput();
     void startCurrentLtcOutput();
+    void startCurrentGenAudio();
     void updateCurrentOutputStates();
 
     void populateAudioInputChannels();
     void populateAudioOutputChannels();
     void populateThruOutputChannels();
+    void populateGenAudioChannels();
     void populateAudioBpmChannels();
     void restartAudioBpm();
 
@@ -629,6 +656,7 @@ private:
     void activateGenPreset(const juce::String& name);
     void loadGenPresetToFields(const juce::String& name);
     void openGeneratorPresetEditor();
+    void openGeneratorWaveformWindow();
     void setupOscInputServer();
     void startOscInput();
     void stopOscInput();

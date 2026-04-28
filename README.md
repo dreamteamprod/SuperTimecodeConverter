@@ -40,7 +40,7 @@ Audio passthrough (channel 2 thru) remains tied to the primary engine (Engine 1)
 - **MTC (MIDI Time Code)** — receive timecode from any MIDI device
 - **Art-Net** — receive Art-Net timecode over the network (configurable interface/port)
 - **LTC (Linear Time Code)** — decode LTC audio signal from any audio input device and channel
-- **Generator** — internal timecode generator with two modes: **Clock** (reads system wall clock for scheduled programming) or **Transport** (play/pause/stop with configurable start/stop timecodes). Includes a **preset system** with named timecode ranges (stored in `generator_presets.json`) — select a preset and press GO to instantly load start/stop timecodes and begin playback. Presets can be imported/exported as JSON files. Supports **OSC remote control** on a configurable UDP port (default 9800) for integration with show controllers, QLab, Companion, and other OSC-capable software.
+- **Generator** — internal timecode generator with two modes: **Clock** (reads system wall clock for scheduled programming) or **Transport** (play/pause/stop with configurable start/stop timecodes). Includes a **preset system** with named timecode ranges (stored in `generator_presets.json`) — select a preset and press GO to instantly load start/stop timecodes and begin playback. Presets can be imported/exported as JSON files. Supports **OSC remote control** on a configurable UDP port (default 9800) for integration with show controllers, QLab, Companion, and other OSC-capable software. Each preset can also carry an **audio file** (WAV / AIFF / FLAC / OGG / MP3) that plays in lockstep with the generated timecode — see _Generator Audio Playback_ below.
 - **HippoNet** *(coming soon)* — receive timecode from Green Hippo Hippotizer media servers via HippoNet UDP protocol. Supports **multi-layer** packets (TC 1 / TC 2 selectable). Auto-discovery on port 9009. *Currently disabled pending hardware validation.*
 
 ### Outputs (enable any combination per engine)
@@ -271,6 +271,29 @@ Full TCNet server for direct integration with Resolume Arena, ChamSys, Avolites,
 
 Protocol reference: https://www.tc-supply.com/tcnet
 
+### Generator Audio Playback
+
+The internal Generator can play an audio file synchronised with the timecode it produces. Useful for shows where a CDJ is not available but the timecode still has to drive a song.
+
+- **Per-preset audio file** — each Generator preset stores an absolute path to a WAV / AIFF / FLAC / OGG / MP3 file plus a Loop flag. Activating the preset (GO button or `/stc/N/gen/preset` OSC) loads the file and starts playback at the preset's Start TC. The audio file association is global to the preset, so any engine that activates it loads the same file.
+- **Per-engine output** — each engine has its own audio output device for playback, independent of the LTC output. Stereo (Ch 1+2) or specific mono channel routing.
+- **File channel selection** — choose **Stereo (L+R)**, **Left only**, or **Right only** to handle industry-standard files that carry programme audio on one channel and LTC on the other. The unselected channel is silenced and the audio is centred in the stereo image.
+- **Per-engine sample rate / buffer** — override the global preferred values for the playback device only. Useful for cards that don't share a clock between LTC and music outputs.
+- **Volume slider** — linear 0..1.5 (1.0 = unity, with headroom for low-level recordings). Available both in the Generator panel and in the floating waveform window, kept in sync.
+- **Transport sync** — Play / Pause / Stop drive both the timecode and the audio in lockstep. Pause is instant (the audio callback honours a logical-pause flag rather than stopping the transport); resume is gap-free.
+- **Asynchronous file loading** — switching presets never blocks the UI. A dedicated I/O thread loads the new file and attaches it to the transport in the background; rapid navigation across presets is coalesced (only the latest target is loaded). With a 32-entry waveform peak cache, switching back and forth across recently-seen tracks reuses cached peaks instead of re-decoding.
+
+### Waveform Display
+
+A visual companion to the Generator audio playback: a waveform view of the loaded file with a real-time playhead cursor and click-to-seek.
+
+- **Mini waveform** — embedded in the Generator panel, shows an overview of the loaded track. Non-interactive; clicking it opens the floating window.
+- **Floating waveform window** — opened with the `WAVEFORM` button. Shows the filename, current / total file time, a large absolute-TC display, the full-width waveform with file-time markers above and absolute-TC markers below, transport buttons, prev / next / edit navigation buttons, and the volume slider. Window size and position are persisted across sessions.
+- **DAW-style stereo rendering** — left channel above the centreline, right channel below (Ableton / Logic / Reaper convention).
+- **Click-to-seek and drag-to-scrub** — clicking the waveform seeks both the audio and the generated timecode to that position. Dragging continuously seeks (scrubbing). A semi-transparent hover line previews where a click would land, with a tooltip showing the file time and absolute TC at the cursor.
+- **State-aware seek** — Playing keeps playing from the new position; Paused stays paused at the new position; Stopped transitions to Paused (preserves the seek so the next Play resumes from there instead of resetting to Start TC).
+- **Show Lock** — seek and the EDIT button are blocked under Show Lock; transport, navigation and volume remain operational.
+
 ### Shared MIDI Output
 
 When MTC output and MIDI triggers/clock/mixer forward target the same MIDI port, STC automatically shares the connection. No configuration needed — both features work simultaneously on a single port, even on Windows where MIDI ports allow only one handle at a time.
@@ -367,7 +390,7 @@ The sections below are for developers who want to build STC from source.
 3. **Create a `CMakeLists.txt`** in the project root:
    ```cmake
    cmake_minimum_required(VERSION 3.22)
-   project(SuperTimecodeConverter VERSION 1.9.6)
+   project(SuperTimecodeConverter VERSION 1.9.7)
 
    set(CMAKE_CXX_STANDARD 17)
    set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -377,7 +400,7 @@ The sections below are for developers who want to build STC from source.
    juce_add_gui_app(SuperTimecodeConverter
        PRODUCT_NAME "Super Timecode Converter"
        COMPANY_NAME "Fiverecords"
-       VERSION "1.9.6"
+       VERSION "1.9.7"
        HARDENED_RUNTIME_ENABLED TRUE
        HARDENED_RUNTIME_OPTIONS com.apple.security.device.audio-input
        MICROPHONE_PERMISSION_ENABLED TRUE

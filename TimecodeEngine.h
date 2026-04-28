@@ -20,6 +20,7 @@
 #include "LinkBridge.h"
 #include "AudioThru.h"
 #include "AudioBpmInput.h"
+#include "GeneratorAudioPlayer.h"
 #include "AppSettings.h"
 #include "MixerMap.h"
 #include <memory>
@@ -1813,16 +1814,35 @@ public:
     void generatorPlay()
     {
         if (genState == GeneratorState::Playing) return;
-        if (genState == GeneratorState::Stopped)
+
+        const bool wasStopped = (genState == GeneratorState::Stopped);
+        if (wasStopped)
             genCurrentMs = genStartMs;  // reset to start TC
         genLastTickTime = juce::Time::getMillisecondCounterHiRes();
         genState = GeneratorState::Playing;
+
+        // Sync attached audio file with the generator position.  Skip the
+        // seek when resuming from Pause: the audio transport already paused
+        // at exactly this position, and seeking would invalidate the audio
+        // reader's read-ahead buffer (a noticeable delay with MP3 because
+        // the decoder has to re-decode frames from scratch).  Seeking is
+        // only needed when coming back from Stop (position has been reset
+        // to Start TC) or after an explicit setGeneratorPosition().
+        if (wasStopped)
+        {
+            const double audioPosSec = juce::jmax(0.0, (genCurrentMs - genStartMs) / 1000.0);
+            generatorAudioPlayer.seekSeconds(audioPosSec);
+        }
+        generatorAudioPlayer.play();
     }
 
     void generatorPause()
     {
         if (genState == GeneratorState::Playing)
+        {
             genState = GeneratorState::Paused;
+            generatorAudioPlayer.pause();
+        }
     }
 
     void generatorStop()
@@ -1831,6 +1851,7 @@ public:
         genCurrentMs = genStartMs;
         if (activeInput == InputSource::SystemTime)
             currentTimecode = wallClockToTimecode(genCurrentMs, currentFps);
+        generatorAudioPlayer.stopAndReset();
     }
 
     /// Set start timecode in ms from midnight.
@@ -1847,6 +1868,31 @@ public:
     /// Set stop timecode in ms from midnight. 0 = no stop (freerun).
     void setGeneratorStopMs(double ms) { genStopMs = juce::jmax(0.0, ms); }
 
+    /// Seek the generator to a specific position (in ms from midnight) and
+    /// resync the attached audio file.  State transitions:
+    ///   Playing -> Playing (audio keeps playing from new pos)
+    ///   Paused  -> Paused  (audio at new pos, not playing)
+    ///   Stopped -> Paused  (preserves the seeked position; if we stayed in
+    ///                       Stopped, the next generatorPlay() would reset
+    ///                       genCurrentMs to genStartMs and discard the seek)
+    ///
+    /// The caller is responsible for any clamping (e.g. against Stop TC or
+    /// the audio file's length); this method only enforces newMs >= 0.
+    void setGeneratorPosition(double newMs)
+    {
+        genCurrentMs    = juce::jmax(0.0, newMs);
+        genLastTickTime = juce::Time::getMillisecondCounterHiRes();
+
+        if (genState == GeneratorState::Stopped)
+            genState = GeneratorState::Paused;
+
+        if (activeInput == InputSource::SystemTime)
+            currentTimecode = wallClockToTimecode(genCurrentMs, currentFps);
+
+        const double audioPosSec = juce::jmax(0.0, (genCurrentMs - genStartMs) / 1000.0);
+        generatorAudioPlayer.seekSeconds(audioPosSec);
+    }
+
     double getGeneratorStartMs() const { return genStartMs; }
     double getGeneratorStopMs()  const { return genStopMs; }
     double getGeneratorCurrentMs() const { return genCurrentMs; }
@@ -1859,6 +1905,60 @@ public:
         genClockMode = useSystemClock;
     }
     bool getGeneratorClockMode() const { return genClockMode; }
+
+    //==========================================================================
+    // Generator audio playback (per-engine output device for preset audio files)
+    //==========================================================================
+    /// Open or change the generator audio output device.
+    /// channel: -1 = stereo (file L->ch0, R->ch1); >=0 = mono mix to that channel.
+    bool startGeneratorAudio(const juce::String& typeName,
+                              const juce::String& devName,
+                              int channel = -1,
+                              double sampleRate = 0,
+                              int bufferSize = 0)
+    {
+        return generatorAudioPlayer.openDevice(typeName, devName, channel, sampleRate, bufferSize);
+    }
+
+    void stopGeneratorAudio() { generatorAudioPlayer.closeDevice(); }
+
+    bool isGeneratorAudioRunning() const { return generatorAudioPlayer.isDeviceOpen(); }
+
+    /// Load (or unload, when file is empty/missing) an audio file for the generator.
+    /// Loop flag is applied at the same time so subsequent file ends honour it.
+    /// Returns immediately -- the actual load runs on a dedicated I/O thread.
+    void setGeneratorAudioFile(const juce::File& file, bool shouldLoop)
+    {
+        const juce::File f = (file == juce::File() || ! file.existsAsFile()) ? juce::File() : file;
+        generatorAudioPlayer.requestLoad(f, shouldLoop);
+    }
+
+    void clearGeneratorAudioFile() { generatorAudioPlayer.requestLoad(juce::File(), false); }
+
+    bool       hasGeneratorAudioFile()    const { return generatorAudioPlayer.hasFileLoaded(); }
+    juce::File getGeneratorAudioFile()    const { return generatorAudioPlayer.getCurrentFile(); }
+    bool       isGeneratorAudioPlaying()  const { return generatorAudioPlayer.isPlaying(); }
+    bool       isGeneratorAudioLooping()  const { return generatorAudioPlayer.isLooping(); }
+
+    /// Output volume for the generator audio playback (0..1.5 linear, 1=unity).
+    void  setGeneratorAudioVolume(float linearGain) { generatorAudioPlayer.setOutputVolume(linearGain); }
+    float getGeneratorAudioVolume() const           { return generatorAudioPlayer.getOutputVolume(); }
+
+    /// Source-channel mode for the loaded audio file:
+    /// 0 = stereo (use both), 1 = left-only, 2 = right-only.
+    /// Useful for files that carry programme audio on one side and a
+    /// reference signal (LTC, click track, etc.) on the other.
+    void setGeneratorAudioFileChannelMode(int mode)
+    {
+        generatorAudioPlayer.setFileChannelMode((GeneratorAudioPlayer::FileChannelMode) mode);
+    }
+    int getGeneratorAudioFileChannelMode() const
+    {
+        return (int) generatorAudioPlayer.getFileChannelMode();
+    }
+
+    GeneratorAudioPlayer&       getGeneratorAudio()       { return generatorAudioPlayer; }
+    const GeneratorAudioPlayer& getGeneratorAudio() const { return generatorAudioPlayer; }
 
     //==========================================================================
     // VU meter smoothed levels
@@ -1976,6 +2076,9 @@ private:
     double genStopMs    = 0.0;     // stop TC in ms (0 = freerun)
     double genCurrentMs = 0.0;     // current position in ms
     double genLastTickTime = 0.0;  // hiRes ms for delta calculation
+
+    // Generator audio playback (per-engine, optional)
+    GeneratorAudioPlayer generatorAudioPlayer;
 
     // FPS conversion
     bool fpsConvertEnabled = false;
@@ -2918,6 +3021,7 @@ private:
             {
                 genCurrentMs = genStopMs;
                 genState = GeneratorState::Stopped;
+                generatorAudioPlayer.stopAndReset();
             }
         }
         // Stopped and Paused: genCurrentMs stays where it is

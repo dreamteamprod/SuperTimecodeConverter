@@ -20,7 +20,7 @@ public:
     GeneratorPresetEditor(GeneratorPresetMap& map)
         : presetMap(map)
     {
-        setSize(480, 360);
+        setSize(560, 440);
         rebuildRows();
 
         // --- Table ---
@@ -34,9 +34,10 @@ public:
         table.getHeader().setStretchToFitActive(true);
 
         auto& hdr = table.getHeader();
-        hdr.addColumn("Name",     ColName,    160, 80, 300, juce::TableHeaderComponent::notSortable);
-        hdr.addColumn("Start TC", ColStart,   120, 80, 180, juce::TableHeaderComponent::notSortable);
-        hdr.addColumn("Stop TC",  ColStop,    120, 80, 180, juce::TableHeaderComponent::notSortable);
+        hdr.addColumn("Name",     ColName,    140, 80, 300, juce::TableHeaderComponent::notSortable);
+        hdr.addColumn("Start TC", ColStart,   100, 80, 180, juce::TableHeaderComponent::notSortable);
+        hdr.addColumn("Stop TC",  ColStop,    100, 80, 180, juce::TableHeaderComponent::notSortable);
+        hdr.addColumn("Audio",    ColAudio,   180,  0, 600, juce::TableHeaderComponent::notSortable);
 
         // --- Buttons ---
         auto addBtn = [this](juce::TextButton& btn, const juce::String& text)
@@ -93,6 +94,25 @@ public:
         addField(lblName,    edName,    "Name:",     "");
         addField(lblStartTC, edStartTC, "Start TC:", "00:00:00:00");
         addField(lblStopTC,  edStopTC,  "Stop TC:",  "00:00:00:00");
+        addField(lblAudio,   edAudio,   "Audio:",    "");
+        edAudio.setReadOnly(true);
+        edAudio.setColour(juce::TextEditor::textColourId, juce::Colour(0xFFCCCCCC));
+
+        addAndMakeVisible(btnBrowseAudio);
+        btnBrowseAudio.setButtonText("...");
+        btnBrowseAudio.setColour(juce::TextButton::buttonColourId, bgPanel);
+        btnBrowseAudio.setColour(juce::TextButton::textColourOffId, textBright);
+        btnBrowseAudio.onClick = [this] { browseForAudio(); };
+
+        addAndMakeVisible(btnClearAudio);
+        btnClearAudio.setButtonText("X");
+        btnClearAudio.setColour(juce::TextButton::buttonColourId, bgPanel);
+        btnClearAudio.setColour(juce::TextButton::textColourOffId, juce::Colour(0xFFFF6666));
+        btnClearAudio.onClick = [this] { clearAudioField(); };
+
+        addAndMakeVisible(btnLoopAudio);
+        btnLoopAudio.setButtonText("Loop audio file when it ends");
+        btnLoopAudio.setColour(juce::ToggleButton::textColourId, textBright);
 
         edName.onReturnKey    = [this] { saveSelectedPreset(); };
         edStartTC.onReturnKey = [this] { saveSelectedPreset(); };
@@ -129,6 +149,13 @@ public:
             case ColName:  text = p.name;    break;
             case ColStart: text = p.startTC; break;
             case ColStop:  text = p.stopTC;  break;
+            case ColAudio:
+                if (p.audioFilePath.isNotEmpty())
+                {
+                    text = juce::File(p.audioFilePath).getFileName();
+                    if (p.audioLoop) text += "  (loop)";
+                }
+                break;
         }
         g.drawText(text, 4, 0, width - 8, height, juce::Justification::centredLeft, true);
     }
@@ -141,6 +168,8 @@ public:
             edName.setText(p.name, false);
             edStartTC.setText(p.startTC, false);
             edStopTC.setText(p.stopTC, false);
+            edAudio.setText(p.audioFilePath, false);
+            btnLoopAudio.setToggleState(p.audioLoop, juce::dontSendNotification);
         }
     }
 
@@ -157,8 +186,8 @@ public:
     {
         auto area = getLocalBounds().reduced(8);
 
-        // Bottom form: 3 rows of label+editor + 2 button rows
-        auto formArea = area.removeFromBottom(140);
+        // Bottom form: 5 rows of label+editor + loop row + 2 button rows
+        auto formArea = area.removeFromBottom(210);
         area.removeFromBottom(6);
 
         // File operations row (Import / Export / OSC Help)
@@ -179,25 +208,45 @@ public:
         formArea.removeFromBottom(6);
 
         // Form fields
-        auto layField = [](juce::Label& lbl, juce::TextEditor& ed, juce::Rectangle<int>& area)
+        auto layField = [](juce::Label& lbl, juce::TextEditor& ed, juce::Rectangle<int>& fa)
         {
-            auto row = area.removeFromTop(22);
+            auto row = fa.removeFromTop(22);
             lbl.setBounds(row.removeFromLeft(60));
             row.removeFromLeft(4);
             ed.setBounds(row);
-            area.removeFromTop(3);
+            fa.removeFromTop(3);
         };
 
         layField(lblName,    edName,    formArea);
         layField(lblStartTC, edStartTC, formArea);
         layField(lblStopTC,  edStopTC,  formArea);
 
+        // Audio row: label + editor + Browse + Clear inline
+        {
+            auto row = formArea.removeFromTop(22);
+            lblAudio.setBounds(row.removeFromLeft(60));
+            row.removeFromLeft(4);
+            btnClearAudio .setBounds(row.removeFromRight(24));
+            row.removeFromRight(2);
+            btnBrowseAudio.setBounds(row.removeFromRight(30));
+            row.removeFromRight(4);
+            edAudio.setBounds(row);
+            formArea.removeFromTop(3);
+        }
+
+        // Loop checkbox row (offset from labels for alignment)
+        {
+            auto row = formArea.removeFromTop(22);
+            row.removeFromLeft(64);
+            btnLoopAudio.setBounds(row);
+        }
+
         // Table fills the rest
         table.setBounds(area);
     }
 
 private:
-    enum { ColName = 1, ColStart, ColStop };
+    enum { ColName = 1, ColStart, ColStop, ColAudio };
 
     GeneratorPresetMap& presetMap;
     juce::TableListBox table { "Presets", this };
@@ -207,10 +256,12 @@ private:
     // Buttons
     juce::TextButton btnAdd, btnSave, btnDelete, btnClearAll;
     juce::TextButton btnImport, btnExport, btnOscHelp;
+    juce::TextButton btnBrowseAudio, btnClearAudio;
+    juce::ToggleButton btnLoopAudio;
 
     // Form
-    juce::Label      lblName, lblStartTC, lblStopTC;
-    juce::TextEditor edName, edStartTC, edStopTC;
+    juce::Label      lblName, lblStartTC, lblStopTC, lblAudio;
+    juce::TextEditor edName, edStartTC, edStopTC, edAudio;
 
     // File chooser (must persist during async operation)
     std::unique_ptr<juce::FileChooser> fileChooser;
@@ -274,6 +325,8 @@ private:
         p.name    = name;
         p.startTC = edStartTC.getText().trim();
         p.stopTC  = edStopTC.getText().trim();
+        p.audioFilePath = edAudio.getText().trim();
+        p.audioLoop     = btnLoopAudio.getToggleState();
         if (p.startTC.isEmpty()) p.startTC = "00:00:00:00";
         if (p.stopTC.isEmpty())  p.stopTC  = "00:00:00:00";
         p.startTC = normalizeTC(p.startTC);
@@ -314,6 +367,8 @@ private:
         p.name    = name;
         p.startTC = edStartTC.getText().trim();
         p.stopTC  = edStopTC.getText().trim();
+        p.audioFilePath = edAudio.getText().trim();
+        p.audioLoop     = btnLoopAudio.getToggleState();
         if (p.startTC.isEmpty()) p.startTC = "00:00:00:00";
         if (p.stopTC.isEmpty())  p.stopTC  = "00:00:00:00";
         p.startTC = normalizeTC(p.startTC);
@@ -337,6 +392,8 @@ private:
         edName.clear();
         edStartTC.setText("00:00:00:00", false);
         edStopTC.setText("00:00:00:00", false);
+        edAudio.clear();
+        btnLoopAudio.setToggleState(false, juce::dontSendNotification);
     }
 
     void clearAll()
@@ -360,11 +417,59 @@ private:
                     edName.clear();
                     edStartTC.setText("00:00:00:00", false);
                     edStopTC.setText("00:00:00:00", false);
+                    edAudio.clear();
+                    btnLoopAudio.setToggleState(false, juce::dontSendNotification);
                 }
             });
     }
 
     juce::ScopedMessageBox confirmBox;
+
+    void browseForAudio()
+    {
+        // Build a wildcard list of supported audio extensions.  We do not
+        // construct an AudioFormatManager here just to query extensions; the
+        // file chooser will accept anything matching this pattern and the
+        // engine will validate when loading.
+        juce::String wildcards = "*.wav;*.aif;*.aiff;*.flac;*.ogg";
+       #if JUCE_USE_MP3AUDIOFORMAT
+        wildcards += ";*.mp3";
+       #endif
+
+        // Pick a sensible starting directory: the existing file's folder if
+        // it still exists, otherwise the user's Music folder.  Defends
+        // against imported presets pointing to paths that no longer exist.
+        juce::File initial;
+        auto path = edAudio.getText().trim();
+        if (path.isNotEmpty())
+        {
+            juce::File f(path);
+            if (f.existsAsFile() || f.getParentDirectory().exists())
+                initial = f.getParentDirectory();
+        }
+        if (initial == juce::File())
+            initial = juce::File::getSpecialLocation(juce::File::userMusicDirectory);
+
+        fileChooser = std::make_unique<juce::FileChooser>(
+            "Select audio file for preset",
+            initial,
+            wildcards);
+
+        fileChooser->launchAsync(
+            juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+            [this](const juce::FileChooser& fc)
+            {
+                auto file = fc.getResult();
+                if (file == juce::File() || ! file.existsAsFile()) return;
+                edAudio.setText(file.getFullPathName(), false);
+            });
+    }
+
+    void clearAudioField()
+    {
+        edAudio.clear();
+        btnLoopAudio.setToggleState(false, juce::dontSendNotification);
+    }
 
     void exportPresets()
     {

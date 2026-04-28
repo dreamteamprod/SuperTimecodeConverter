@@ -833,6 +833,8 @@ struct GeneratorPreset
     juce::String name;                          // unique key, e.g. "INTRO"
     juce::String startTC = "00:00:00:00";       // HH:MM:SS:FF
     juce::String stopTC  = "00:00:00:00";       // HH:MM:SS:FF (0 = freerun)
+    juce::String audioFilePath;                 // empty = no audio playback
+    bool         audioLoop = false;             // loop file when reaching its end
 
     std::string key() const { return name.toLowerCase().trim().toStdString(); }
     bool hasValidKey() const { return name.trim().isNotEmpty(); }
@@ -840,9 +842,11 @@ struct GeneratorPreset
     juce::var toVar() const
     {
         auto* obj = new juce::DynamicObject();
-        obj->setProperty("name",    name);
-        obj->setProperty("startTC", startTC);
-        obj->setProperty("stopTC",  stopTC);
+        obj->setProperty("name",          name);
+        obj->setProperty("startTC",       startTC);
+        obj->setProperty("stopTC",        stopTC);
+        obj->setProperty("audioFilePath", audioFilePath);
+        obj->setProperty("audioLoop",     audioLoop);
         return juce::var(obj);
     }
 
@@ -850,9 +854,11 @@ struct GeneratorPreset
     {
         auto* obj = v.getDynamicObject();
         if (!obj) return;
-        name    = obj->getProperty("name").toString();
-        startTC = obj->getProperty("startTC").toString();
-        stopTC  = obj->getProperty("stopTC").toString();
+        name          = obj->getProperty("name").toString();
+        startTC       = obj->getProperty("startTC").toString();
+        stopTC        = obj->getProperty("stopTC").toString();
+        audioFilePath = obj->getProperty("audioFilePath").toString();
+        audioLoop     = (bool) obj->getProperty("audioLoop");
         if (startTC.isEmpty()) startTC = "00:00:00:00";
         if (stopTC.isEmpty())  stopTC  = "00:00:00:00";
     }
@@ -972,6 +978,16 @@ struct EngineSettings
     bool   generatorClockMode = true;  // true = wall clock, false = transport
     double generatorStartMs = 0.0;    // start TC in ms from midnight
     double generatorStopMs  = 0.0;    // stop TC in ms (0 = freerun)
+    // Generator audio playback (per-engine output device for preset audio files)
+    juce::String generatorAudioDevice = "";
+    juce::String generatorAudioType   = "";
+    int          generatorAudioChannel = 0;
+    bool         generatorAudioStereo  = true;
+    bool         generatorAudioEnabled = false;
+    float        generatorAudioVolume  = 1.0f;   // 0..1.5, 1=unity
+    double       generatorAudioSampleRate = 0.0; // 0 = use global preferred
+    int          generatorAudioBufferSize = 0;   // 0 = use global preferred
+    int          generatorAudioFileChannelMode = 0; // 0=Stereo, 1=L only, 2=R only
     // Pro DJ Link
     int proDJLinkPlayer = 1;
     bool trackMapEnabled = false;
@@ -1068,6 +1084,15 @@ struct EngineSettings
         obj->setProperty("generatorClockMode", generatorClockMode);
         obj->setProperty("generatorStartMs", generatorStartMs);
         obj->setProperty("generatorStopMs", generatorStopMs);
+        obj->setProperty("generatorAudioDevice",  generatorAudioDevice);
+        obj->setProperty("generatorAudioType",    generatorAudioType);
+        obj->setProperty("generatorAudioChannel", generatorAudioChannel);
+        obj->setProperty("generatorAudioStereo",  generatorAudioStereo);
+        obj->setProperty("generatorAudioEnabled", generatorAudioEnabled);
+        obj->setProperty("generatorAudioVolume",  (double) generatorAudioVolume);
+        obj->setProperty("generatorAudioSampleRate", generatorAudioSampleRate);
+        obj->setProperty("generatorAudioBufferSize", generatorAudioBufferSize);
+        obj->setProperty("generatorAudioFileChannelMode", generatorAudioFileChannelMode);
         obj->setProperty("proDJLinkPlayer", proDJLinkPlayer);
         obj->setProperty("trackMapEnabled", trackMapEnabled);
         obj->setProperty("midiClockEnabled", midiClockEnabled);
@@ -1155,6 +1180,10 @@ struct EngineSettings
             auto val = obj->getProperty(key);
             return val.isVoid() ? def : (int)val;
         };
+        auto getDouble = [&](const char* key, double def) {
+            auto val = obj->getProperty(key);
+            return val.isVoid() ? def : (double)val;
+        };
         auto getString = [&](const char* key, const juce::String& def = {}) {
             auto val = obj->getProperty(key);
             return val.isVoid() ? def : val.toString();
@@ -1169,6 +1198,15 @@ struct EngineSettings
         generatorClockMode       = getBool("generatorClockMode", true);
         generatorStartMs         = (double)getInt("generatorStartMs", 0);
         generatorStopMs          = (double)getInt("generatorStopMs", 0);
+        generatorAudioDevice     = getString("generatorAudioDevice");
+        generatorAudioType       = getString("generatorAudioType");
+        generatorAudioChannel    = getInt("generatorAudioChannel", 0);
+        generatorAudioStereo     = getBool("generatorAudioStereo", true);
+        generatorAudioEnabled    = getBool("generatorAudioEnabled", false);
+        generatorAudioVolume     = (float) getDouble("generatorAudioVolume", 1.0);
+        generatorAudioSampleRate = getDouble("generatorAudioSampleRate", 0.0);
+        generatorAudioBufferSize = getInt("generatorAudioBufferSize", 0);
+        generatorAudioFileChannelMode = getInt("generatorAudioFileChannelMode", 0);
         proDJLinkPlayer      = juce::jlimit(1, 8, getInt("proDJLinkPlayer", 1));
         trackMapEnabled      = getBool("trackMapEnabled", getBool("tcnetTrackMapEnabled", false));
         midiClockEnabled     = getBool("midiClockEnabled", getBool("tcnetMidiClock", false));
@@ -1290,6 +1328,7 @@ struct AppSettings
     juce::String mixerMapBounds;
     juce::String cuePointBounds;
     juce::String genPresetBounds;
+    juce::String genWaveformBounds;
 
     // PDL View layout state
     bool pdlViewHorizontal  = false;
@@ -1348,6 +1387,7 @@ struct AppSettings
         if (mixerMapBounds.isNotEmpty())   obj->setProperty("mixerMapBounds",  mixerMapBounds);
         if (cuePointBounds.isNotEmpty())  obj->setProperty("cuePointBounds", cuePointBounds);
         if (genPresetBounds.isNotEmpty()) obj->setProperty("genPresetBounds", genPresetBounds);
+        if (genWaveformBounds.isNotEmpty()) obj->setProperty("genWaveformBounds", genWaveformBounds);
         obj->setProperty("pdlViewHorizontal", pdlViewHorizontal);
         obj->setProperty("pdlViewShowMixer",  pdlViewShowMixer);
         obj->setProperty("slqViewHorizontal", slqViewHorizontal);
@@ -1416,6 +1456,7 @@ struct AppSettings
             mixerMapBounds  = getString("mixerMapBounds");
             cuePointBounds  = getString("cuePointBounds");
             genPresetBounds = getString("genPresetBounds");
+            genWaveformBounds = getString("genWaveformBounds");
             pdlViewHorizontal  = getInt("pdlViewHorizontal", 0) != 0;
             pdlViewShowMixer   = getInt("pdlViewShowMixer", 1) != 0;
             slqViewHorizontal  = getInt("slqViewHorizontal", 0) != 0;
