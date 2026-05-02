@@ -390,7 +390,7 @@ The sections below are for developers who want to build STC from source.
 3. **Create a `CMakeLists.txt`** in the project root:
    ```cmake
    cmake_minimum_required(VERSION 3.22)
-   project(SuperTimecodeConverter VERSION 1.9.7)
+   project(SuperTimecodeConverter VERSION 1.9.8)
 
    set(CMAKE_CXX_STANDARD 17)
    set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -400,7 +400,7 @@ The sections below are for developers who want to build STC from source.
    juce_add_gui_app(SuperTimecodeConverter
        PRODUCT_NAME "Super Timecode Converter"
        COMPANY_NAME "Fiverecords"
-       VERSION "1.9.7"
+       VERSION "1.9.8"
        HARDENED_RUNTIME_ENABLED TRUE
        HARDENED_RUNTIME_OPTIONS com.apple.security.device.audio-input
        MICROPHONE_PERMISSION_ENABLED TRUE
@@ -646,6 +646,7 @@ The application is built around a modular, header-only architecture:
 | `TrackMapEditor.h` | Table editor for artist+title -> timecode offset + trigger mapping |
 | `CuePointEditor.h` | Table editor for per-track cue points with waveform strip, click + drag cursor, Capture from live playhead |
 | `GeneratorPresetEditor.h` | Table editor for generator presets (Name, Start TC, Stop TC) |
+| `GeneratorCuePointEditor.h` | Per-preset cue point editor with mirror waveform strip, click + drag cursor, and live playback cursor |
 | `MixerMapEditor.h` | Table editor for DJM parameter -> protocol output mapping |
 | `TimecodeDisplay.h` | Real-time timecode display widget |
 | `LevelMeter.h` | Real-time VU meter component with clipping indicator |

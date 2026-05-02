@@ -141,46 +141,74 @@ MainComponent::MainComponent()
         if (syncing || isShowLocked()) return;
         auto& eng = currentEngine();
         if (eng.getActiveInput() == SrcType::MTC) { inputConfigExpanded = !inputConfigExpanded; updateDeviceSelectorVisibility(); resized(); }
-        else { inputConfigExpanded = true; eng.setInputSource(SrcType::MTC); startCurrentMtcInput(); updateInputButtonStates(); updateDeviceSelectorVisibility(); resized(); saveSettings(); }
+        else { inputConfigExpanded = true; eng.setInputSource(SrcType::MTC); startCurrentMtcInput(); updateInputButtonStates(); updateDeviceSelectorVisibility(); resized(); populateFilteredOutputDeviceCombos(); saveSettings(); }
     };
     btnArtnetIn.onClick = [this] {
         if (syncing || isShowLocked()) return;
         auto& eng = currentEngine();
         if (eng.getActiveInput() == SrcType::ArtNet) { inputConfigExpanded = !inputConfigExpanded; updateDeviceSelectorVisibility(); resized(); }
-        else { inputConfigExpanded = true; eng.setInputSource(SrcType::ArtNet); startCurrentArtnetInput(); updateInputButtonStates(); updateDeviceSelectorVisibility(); resized(); saveSettings(); }
+        else { inputConfigExpanded = true; eng.setInputSource(SrcType::ArtNet); startCurrentArtnetInput(); updateInputButtonStates(); updateDeviceSelectorVisibility(); resized(); populateFilteredOutputDeviceCombos(); saveSettings(); }
     };
     btnSysTime.onClick = [this] {
         if (syncing || isShowLocked()) return;
         auto& eng = currentEngine();
         if (eng.getActiveInput() == SrcType::SystemTime) { inputConfigExpanded = !inputConfigExpanded; updateDeviceSelectorVisibility(); resized(); }
-        else { inputConfigExpanded = true; eng.setInputSource(SrcType::SystemTime); updateInputButtonStates(); updateDeviceSelectorVisibility(); resized(); saveSettings(); }
+        else
+        {
+            inputConfigExpanded = true;
+            eng.setInputSource(SrcType::SystemTime);
+            // Reopen the Generator audio output if the toggle was left on
+            // from before -- setInputSource() closed it when leaving
+            // SystemTime to free the device for other engines, so the
+            // symmetrical thing on returning is to reopen if the user
+            // had it on.
+            if (btnGenAudioOut.getToggleState()
+                && cmbGenAudioDevice.getSelectedId() > 0
+                && cmbGenAudioDevice.getSelectedId() != kPlaceholderItemId)
+            {
+                startCurrentGenAudio();
+            }
+            // Re-push the selected preset's cues into the engine.
+            // setInputSource cleared armedCues + rawGeneratorCues to keep
+            // sources from leaking into each other; without this restore
+            // the user would have to re-select their preset in the combo
+            // for cues to fire after switching back from another input.
+            if (cmbGenPreset.isVisible() && cmbGenPreset.getSelectedId() > 0)
+            {
+                if (auto* preset = settings.generatorPresets.find(cmbGenPreset.getText()))
+                    eng.setGeneratorCuePoints(preset->cuePoints);
+            }
+            updateInputButtonStates(); updateDeviceSelectorVisibility(); resized();
+            populateFilteredOutputDeviceCombos();  // refresh markers (Gen audio device may have changed occupancy)
+            saveSettings();
+        }
     };
     btnLtcIn.onClick = [this] {
         if (syncing || isShowLocked()) return;
         auto& eng = currentEngine();
         if (eng.getActiveInput() == SrcType::LTC) { inputConfigExpanded = !inputConfigExpanded; updateDeviceSelectorVisibility(); resized(); }
-        else { inputConfigExpanded = true; eng.setInputSource(SrcType::LTC); if (!scannedAudioInputs.isEmpty()) startCurrentLtcInput(); updateInputButtonStates(); updateDeviceSelectorVisibility(); resized(); saveSettings(); }
+        else { inputConfigExpanded = true; eng.setInputSource(SrcType::LTC); if (!scannedAudioInputs.isEmpty()) startCurrentLtcInput(); updateInputButtonStates(); updateDeviceSelectorVisibility(); resized(); populateFilteredOutputDeviceCombos(); saveSettings(); }
     };
 
     btnProDJLinkIn.onClick = [this] {
         if (syncing || isShowLocked()) return;
         auto& eng = currentEngine();
         if (eng.getActiveInput() == SrcType::ProDJLink) { inputConfigExpanded = !inputConfigExpanded; updateDeviceSelectorVisibility(); resized(); }
-        else { inputConfigExpanded = true; eng.setInputSource(SrcType::ProDJLink); startCurrentProDJLinkInput(); updateInputButtonStates(); updateDeviceSelectorVisibility(); resized(); saveSettings(); }
+        else { inputConfigExpanded = true; eng.setInputSource(SrcType::ProDJLink); startCurrentProDJLinkInput(); updateInputButtonStates(); updateDeviceSelectorVisibility(); resized(); populateFilteredOutputDeviceCombos(); saveSettings(); }
     };
 
     btnStageLinQIn.onClick = [this] {
         if (syncing || isShowLocked()) return;
         auto& eng = currentEngine();
         if (eng.getActiveInput() == SrcType::StageLinQ) { inputConfigExpanded = !inputConfigExpanded; updateDeviceSelectorVisibility(); resized(); }
-        else { inputConfigExpanded = true; eng.setInputSource(SrcType::StageLinQ); startCurrentStageLinQInput(); updateInputButtonStates(); updateDeviceSelectorVisibility(); resized(); saveSettings(); }
+        else { inputConfigExpanded = true; eng.setInputSource(SrcType::StageLinQ); startCurrentStageLinQInput(); updateInputButtonStates(); updateDeviceSelectorVisibility(); resized(); populateFilteredOutputDeviceCombos(); saveSettings(); }
     };
 
     btnHippoIn.onClick = [this] {
         if (syncing || isShowLocked()) return;
         auto& eng = currentEngine();
         if (eng.getActiveInput() == SrcType::Hippotizer) { inputConfigExpanded = !inputConfigExpanded; updateDeviceSelectorVisibility(); resized(); }
-        else { inputConfigExpanded = true; eng.setInputSource(SrcType::Hippotizer); startCurrentHippotizerInput(); updateInputButtonStates(); updateDeviceSelectorVisibility(); resized(); saveSettings(); }
+        else { inputConfigExpanded = true; eng.setInputSource(SrcType::Hippotizer); startCurrentHippotizerInput(); updateInputButtonStates(); updateDeviceSelectorVisibility(); resized(); populateFilteredOutputDeviceCombos(); saveSettings(); }
     };
 
     // --- Output toggles ---
@@ -235,6 +263,13 @@ MainComponent::MainComponent()
         }
 
         updateCurrentOutputStates();
+        // After toggling outputs, audio devices for LTC out / Thru out are
+        // opened/closed in updateCurrentOutputStates(); MIDI devices for MTC
+        // out are too.  Refresh both combo families so the in-use markers
+        // (bullet for current engine, [ENGINE N] for others) reflect the
+        // new occupancy across all selectors.
+        populateFilteredOutputDeviceCombos();
+        populateMidiAndNetworkCombos();
         updateDeviceSelectorVisibility();
         resized();
         saveSettings();
@@ -573,6 +608,7 @@ MainComponent::MainComponent()
                 startCurrentGenAudio();
             else
                 eng.stopGeneratorAudio();
+            populateFilteredOutputDeviceCombos();  // refresh in-use markers
             updateDeviceSelectorVisibility();
             resized();
             saveSettings();
@@ -589,6 +625,7 @@ MainComponent::MainComponent()
                 && btnGenAudioOut.getToggleState())
             {
                 startCurrentGenAudio();
+                populateFilteredOutputDeviceCombos();  // refresh markers
             }
             saveSettings();
         };
@@ -790,6 +827,7 @@ MainComponent::MainComponent()
         cmbProDJLinkPlayer.addItem("PLAYER " + juce::String(i), i);
     cmbProDJLinkPlayer.addItem("XF-A", 7);
     cmbProDJLinkPlayer.addItem("XF-B", 8);
+    cmbProDJLinkPlayer.addItem("MASTER", 9);
     cmbProDJLinkPlayer.setSelectedId(1, juce::dontSendNotification);
     cmbProDJLinkPlayer.onChange = [this]
     {
@@ -961,6 +999,7 @@ MainComponent::MainComponent()
         if (wantClock)
             currentEngine().setMidiClockEnabled(true);  // re-try now that device is open
         propagateGlobalSettings();
+        populateMidiAndNetworkCombos();  // refresh markers (trigger device may have opened/closed)
         updateDeviceSelectorVisibility();
         saveSettings();
     };
@@ -976,6 +1015,7 @@ MainComponent::MainComponent()
         currentEngine().setOscForward(btnOscFwdBpm.getToggleState(), edOscFwdBpmAddr.getText(), edOscFwdBpmCmd.getText());
         applyTriggerSettings();  // ensure OSC connection is opened/closed
         propagateGlobalSettings();
+        populateMidiAndNetworkCombos();  // refresh markers
         updateDeviceSelectorVisibility();
         saveSettings();
     };
@@ -1035,6 +1075,7 @@ MainComponent::MainComponent()
         currentEngine().setOscMixerForward(btnOscMixerFwd.getToggleState());
         applyTriggerSettings();
         propagateGlobalSettings();
+        populateMidiAndNetworkCombos();  // refresh markers (trigger device may have opened/closed)
         saveSettings();
     };
 
@@ -1051,6 +1092,7 @@ MainComponent::MainComponent()
                                              cmbMidiMixNoteCh.getSelectedId());
         applyTriggerSettings();
         propagateGlobalSettings();
+        populateMidiAndNetworkCombos();  // refresh markers
         updateDeviceSelectorVisibility();
         saveSettings();
     };
@@ -1186,6 +1228,7 @@ MainComponent::MainComponent()
             else
                 currentEngine().stopAudioBpm();
             applyTriggerSettings();
+            populateFilteredInputDeviceCombo();  // refresh markers (BPM device occupancy)
             updateDeviceSelectorVisibility();
             resized();
             saveSettings();
@@ -1305,6 +1348,7 @@ MainComponent::MainComponent()
         if (syncing) return;
         if (isShowLockedToggle(btnTriggerMidi)) return;
         applyTriggerSettings();
+        populateMidiAndNetworkCombos();  // refresh markers (trigger MIDI device occupancy)
         saveSettings();
     };
 
@@ -1316,6 +1360,7 @@ MainComponent::MainComponent()
         if (syncing) return;
         if (isShowLockedRevert()) return;
         applyTriggerSettings();
+        populateMidiAndNetworkCombos();  // refresh markers (trigger MIDI device occupancy)
         saveSettings();
     };
 
@@ -1421,6 +1466,7 @@ MainComponent::MainComponent()
         {
             populateAudioInputChannels();
             restartAudioBpm();
+            populateFilteredInputDeviceCombo();  // refresh markers (BPM device changed)
             saveSettings();
         }
     };
@@ -1854,6 +1900,14 @@ MainComponent::~MainComponent()
     //    threads are stopped while the message manager is still alive.
     //    Also disconnect shared pointers (TrackMap, MixerMap, ProDJLink, DbServer)
     //    so no stale references survive into AppSettings destruction.
+    //
+    // Order is important: the Generator audio player owns a JUCE audio device
+    // and a loader thread that read atomics from this engine; closing the
+    // device explicitly here lets removeAudioCallback wait for the in-flight
+    // callback to return BEFORE engines.clear() races the destructor.  The
+    // same applies to AudioBpm and TriggerOutput.  Without these explicit
+    // stops a closing app could trip an std::atomic load on a member whose
+    // owning engine had already started destruction.
     for (auto& eng : engines)
     {
         eng->setMidiClockEnabled(false);
@@ -1863,6 +1917,10 @@ MainComponent::~MainComponent()
         eng->setSharedProDJLinkInput(nullptr);
         eng->setSharedStageLinQInput(nullptr);
         eng->setDbServerClient(nullptr);
+        eng->stopGeneratorAudio();      // closes JUCE audio device + stops loader thread
+        eng->stopAudioBpm();            // closes BPM input device + analyser thread
+        eng->getTriggerOutput().stopMidi();
+        eng->getTriggerOutput().disconnectOsc();
         eng->stopMtcOutput();
         eng->stopArtnetOutput();
         eng->stopLtcOutput();
@@ -2294,8 +2352,8 @@ void MainComponent::syncUIFromEngine()
             sldBpmInputGain.setValue(eng.getAudioBpmInput().getInputGain() * 100.0f, juce::dontSendNotification);
         }
 
-        // Pro DJ Link (per-engine player)
-        cmbProDJLinkPlayer.setSelectedId(juce::jlimit(1, 8, es.proDJLinkPlayer), juce::dontSendNotification);
+        // Pro DJ Link (per-engine player) -- ids 1-6 = players, 7=XF-A, 8=XF-B, 9=MASTER
+        cmbProDJLinkPlayer.setSelectedId(juce::jlimit(1, 9, es.proDJLinkPlayer), juce::dontSendNotification);
         // ProDJLink interface (global)
         int pdlIfId = settings.proDJLinkInterface + 1;
         if (pdlIfId >= 1 && pdlIfId <= cmbProDJLinkInterface.getNumItems())
@@ -3673,6 +3731,18 @@ juce::String MainComponent::getDeviceInUseMarker(const juce::String& devName,
                 else           { return " [" + eng.getName() + "]"; }
             }
 
+            // MIDI output (Trigger)
+            // The trigger output opens its own MIDI device when not sharing
+            // with MTC; without this case the device looks free even though
+            // the trigger has it locked.
+            if (typeName.isEmpty()
+                && eng.getTriggerOutput().hasOwnMidiOpen()
+                && eng.getTriggerOutput().getCurrentMidiDeviceName() == devName)
+            {
+                if (isCurrent) { result += juce::String::charToString(0x25CF); }
+                else           { return " [" + eng.getName() + " TRIG]"; }
+            }
+
             // Audio output (LTC)
             if (typeName.isNotEmpty()
                 && eng.getLtcOutput().getIsRunning()
@@ -3691,6 +3761,21 @@ juce::String MainComponent::getDeviceInUseMarker(const juce::String& devName,
             {
                 if (isCurrent) { result += juce::String::charToString(0x25CF); }
                 else           { return " [" + eng.getName() + " THRU]"; }
+            }
+
+            // Audio output (Generator audio playback)
+            // Without this, the Generator's bullet (current engine) and
+            // bracketed engine label (other engines) never appear on
+            // cmbGenAudioDevice / cmbAudioOutputDevice / cmbThruOutputDevice
+            // for the device the Generator is using -- the user can't
+            // tell from the UI which device is actually busy.
+            if (typeName.isNotEmpty()
+                && eng.isGeneratorAudioRunning()
+                && eng.getGeneratorAudio().getCurrentDeviceName() == devName
+                && eng.getGeneratorAudio().getCurrentTypeName() == typeName)
+            {
+                if (isCurrent) { result += juce::String::charToString(0x25CF); }
+                else           { return " [" + eng.getName() + " GEN]"; }
             }
         }
     }
@@ -5045,22 +5130,22 @@ void MainComponent::updateDeviceSelectorVisibility()
     bool linkOwnedElsewhere = findLinkOwnerOtherThan(selectedEngine) >= 0;
     lblLinkStatus.setVisible(showBpmOutputs && (btnLink.getToggleState() || linkOwnedElsewhere));
 
-    btnTriggerMidi.setVisible(showProDJLinkIn);
-    cmbTriggerMidiDevice.setVisible(showProDJLinkIn
+    btnTriggerMidi.setVisible(showProDJLinkIn || showGenerator);
+    cmbTriggerMidiDevice.setVisible((showProDJLinkIn || showGenerator)
         && (btnTriggerMidi.getToggleState() || btnMidiClock.getToggleState()
             || btnMidiMixerFwd.getToggleState())
         || (showAudioBpmActive && btnMidiClock.getToggleState()));
-    btnTriggerOsc.setVisible(showProDJLinkIn);
-    btnArtnetTrigger.setVisible(showProDJLinkIn);
+    btnTriggerOsc.setVisible(showProDJLinkIn || showGenerator);
+    btnArtnetTrigger.setVisible(showProDJLinkIn || showGenerator);
     {
-        bool showArtTrig = showProDJLinkIn && btnArtnetTrigger.getToggleState();
+        bool showArtTrig = (showProDJLinkIn || showGenerator) && btnArtnetTrigger.getToggleState();
         cmbArtTrigNet.setVisible(showArtTrig);
         cmbArtTrigSub.setVisible(showArtTrig);
         cmbArtTrigUni.setVisible(showArtTrig);
         lblArtTrigAddr.setVisible(showArtTrig);
     }
     {
-        bool showArtDmxIface = showProDJLinkIn
+        bool showArtDmxIface = (showProDJLinkIn || showGenerator)
             && (btnArtnetMixerFwd.getToggleState() || btnArtnetTrigger.getToggleState());
         cmbArtnetDmxInterface.setVisible(showArtDmxIface);
         lblArtnetDmxInterface.setVisible(showArtDmxIface);
@@ -5068,7 +5153,7 @@ void MainComponent::updateDeviceSelectorVisibility()
     bool showOscConfig = (showProDJLinkIn || showAudioBpmActive)
         && (btnOscFwdBpm.getToggleState() || btnOscMixerFwd.getToggleState());
     bool showOscConfigFull = showOscConfig
-        || (showProDJLinkIn && btnTriggerOsc.getToggleState());
+        || ((showProDJLinkIn || showGenerator) && btnTriggerOsc.getToggleState());
     edOscIp.setVisible(showOscConfigFull);
     edOscPort.setVisible(showOscConfigFull);
 
@@ -5080,7 +5165,7 @@ void MainComponent::updateDeviceSelectorVisibility()
     cmbProDJLinkPlayer.setVisible(showProDJLinkIn);     lblProDJLinkPlayer.setVisible(showProDJLinkIn);
 
     // Repopulate player combo based on input source:
-    // ProDJLink: players 1-6 + XF-A + XF-B
+    // ProDJLink: players 1-6 + XF-A + XF-B + MASTER
     // StageLinQ: decks 1-4 + XF-A + XF-B
     {
         int prevId = cmbProDJLinkPlayer.getSelectedId();
@@ -5091,6 +5176,8 @@ void MainComponent::updateDeviceSelectorVisibility()
                 cmbProDJLinkPlayer.addItem("DECK " + juce::String(i), i);
             cmbProDJLinkPlayer.addItem("XF-A", 7);
             cmbProDJLinkPlayer.addItem("XF-B", 8);
+            // MASTER is not offered for StageLinQ yet (would need parallel
+            // resolveMasterPlayerStageLinQ -- the data is there, just not wired).
             if (prevId < 1 || prevId > 8) prevId = 1;
         }
         else
@@ -5099,7 +5186,8 @@ void MainComponent::updateDeviceSelectorVisibility()
                 cmbProDJLinkPlayer.addItem("PLAYER " + juce::String(i), i);
             cmbProDJLinkPlayer.addItem("XF-A", 7);
             cmbProDJLinkPlayer.addItem("XF-B", 8);
-            if (prevId < 1 || prevId > 8) prevId = 1;
+            cmbProDJLinkPlayer.addItem("MASTER", 9);
+            if (prevId < 1 || prevId > 9) prevId = 1;
         }
         cmbProDJLinkPlayer.setSelectedId(prevId, juce::dontSendNotification);
     }
@@ -5522,6 +5610,11 @@ void MainComponent::loadGenPresetToFields(const juce::String& name)
     // hits GO).
     eng.setGeneratorStartMs(parseTimecodeToMs(preset->startTC, fps));
     eng.setGeneratorStopMs(parseTimecodeToMs(preset->stopTC, fps));
+    // Push cue points into the engine so they fire MIDI / OSC / Art-Net
+    // triggers when the generated TC reaches each cue's positionTC.
+    // setGeneratorCuePoints converts TC -> ms using the engine's current
+    // fps, so it must run after setFrameRate / setGeneratorStartMs above.
+    eng.setGeneratorCuePoints(preset->cuePoints);
 
     if (! eng.isGeneratorAudioPlaying())
     {
@@ -5638,6 +5731,11 @@ void MainComponent::setupOscInputServer()
                         eng.generatorStop();
                         eng.setGeneratorStartMs(parseTimecodeToMs(preset->startTC, fps));
                         eng.setGeneratorStopMs(parseTimecodeToMs(preset->stopTC, fps));
+                        // Push cue points into the engine (same as the UI
+                        // applyGeneratorPreset path).  Without this, OSC-
+                        // triggered preset loads would inherit no cues from
+                        // the preset.
+                        eng.setGeneratorCuePoints(preset->cuePoints);
 
                         // Audio file from the preset (empty path = no audio)
                         juce::File audioFile = preset->audioFilePath.isNotEmpty()
@@ -5706,6 +5804,34 @@ void MainComponent::openGeneratorPresetEditor()
     }
 
     auto* editor = new GeneratorPresetEditor(settings.generatorPresets);
+
+    // Push the engine's current fps so the cue-point editor (when opened
+    // from inside this window) can project cue TC onto the audio strip
+    // consistently with what the engine's armedCues uses internally.
+    editor->setCurrentFpsForCueEditor(frameRateToDouble(currentEngine().getCurrentFps()));
+
+    // Live playback cursor: capture the editor pointer so the lambda can
+    // ask "which preset is currently being edited?" via the table; we
+    // don't know that here but the editor will only forward this getter
+    // to its cue window when a row is selected.  The lambda returns
+    // ms-from-audio-start (i.e. corrected for the preset's startTC) or
+    // -1 when no playback is happening on SystemTime.  Only the engine
+    // currently selected in the UI is consulted -- editing cues for a
+    // preset that isn't the one playing right now still works, but no
+    // playhead is drawn (which is correct: there's nothing to follow).
+    editor->setPlayheadGetter([this]() -> int64_t
+    {
+        auto& eng = currentEngine();
+        if (eng.getActiveInput() != SrcType::SystemTime) return -1;
+        if (eng.getGeneratorState() != TimecodeEngine::GeneratorState::Playing) return -1;
+        // Subtract startMs so the strip's coord space (0 = beginning of
+        // audio file) lines up with the engine's running TC.
+        const double curMs   = eng.getGeneratorCurrentMs();
+        const double startMs = eng.getGeneratorStartMs();
+        const double rel     = curMs - startMs;
+        if (rel < 0.0) return -1;
+        return (int64_t) rel;
+    });
 
     editor->onChange = [this]
     {
@@ -7087,10 +7213,15 @@ void MainComponent::timerCallback()
                     sharedTcnetOutput.setLayerArtwork(layer, nullptr, 0);  // STC logo
                 }
             }
-            // Feed waveform and beat grid from DbServer cache (ProDJLink only).
-            // StageLinQ has its own waveform/beatgrid API but isn't wired up here
-            // yet -- those layers get the BPM-synthesized fallback.
-            if (src == SrcType::ProDJLink && info.title.isNotEmpty() && info.trackId != 0)
+            // Feed waveform and beat grid from DbServer / StageLinQDB caches.
+            // ProDJLink uses sharedDbClient (CDJ track ID lookup); StageLinQ
+            // uses sharedStageLinQDb (network path lookup into the Engine DJ
+            // SQLite database).  Both feed the SAME TCNet APIs, so the only
+            // difference is where the bytes come from.
+            const bool feedFromProDJLink = (src == SrcType::ProDJLink && info.title.isNotEmpty() && info.trackId != 0);
+            const bool feedFromStageLinQ = (src == SrcType::StageLinQ && info.title.isNotEmpty() && sharedStageLinQDb.isDatabaseReady());
+
+            if (feedFromProDJLink)
             {
                 juce::String wfKey = info.artist + "|" + info.title + "|wf";
                 if (info.durationSec > 0) wfKey += "|" + juce::String(info.durationSec);
@@ -7135,6 +7266,135 @@ void MainComponent::timerCallback()
                     }
                     else
                     {
+                        sharedTcnetOutput.setLayerBeatGrid(layer, nullptr, nullptr, 0);
+                    }
+                }
+            }
+            else if (feedFromStageLinQ)
+            {
+                juce::String wfKey = info.artist + "|" + info.title + "|wf";
+                if (info.durationSec > 0) wfKey += "|" + juce::String(info.durationSec);
+                if (tcnetWaveformKey[layer] != wfKey)
+                {
+                    auto netPath = sharedStageLinQInput.getTrackNetworkPath(ep);
+
+                    // Overview waveform: already decoded into Pioneer ThreeBand
+                    // order (mid/high/low, 3 bytes per entry) by the StageLinQ
+                    // decoder, so the TCNet layer accepts it directly with
+                    // bytesPerEntry=3 just like ProDJLink's preview waveform.
+                    //
+                    // Note: we DO NOT update tcnetWaveformKey[layer] until we
+                    // have actually loaded data.  StageLinQ's database query
+                    // is asynchronous; if we commit the key on the first
+                    // attempt we'd skip retries on subsequent feed iterations
+                    // and end up with an empty waveform forever for that
+                    // track.  Committing only on success means we keep
+                    // retrying at 60Hz until the data arrives (or until the
+                    // track changes).
+                    bool committedKey = false;
+
+                    if (netPath.isNotEmpty())
+                    {
+                        auto wf = sharedStageLinQDb.getWaveformForTrack(netPath);
+                        auto perf = sharedStageLinQDb.getPerformanceData(netPath);
+                        const bool haveAnyData = (wf.valid && wf.entryCount > 0)
+                                              || (!perf.beatGrid.empty() && perf.sampleRate > 0.0);
+
+                        if (haveAnyData)
+                        {
+                            tcnetWaveformKey[layer] = wfKey;
+                            committedKey = true;
+
+                            // Apply waveform.
+                            if (wf.valid && wf.entryCount > 0)
+                            {
+                                sharedTcnetOutput.setLayerSmallWaveform(
+                                    layer, wf.data.data(), wf.entryCount, 3);
+                            }
+                            else
+                            {
+                                sharedTcnetOutput.setLayerSmallWaveform(layer, nullptr, 0, 0);
+                            }
+
+                            // Beat grid: Engine DJ stores SPARSE downbeat markers
+                            // (sample offset of every 4th beat in 4/4), not a flat
+                            // beat list.  Expand to per-beat entries with timestamps
+                            // by linearly interpolating between consecutive markers
+                            // -- the gap covers `numBeats` beats so each individual
+                            // beat sits at offset + (i * (next - offset) / numBeats).
+                            // Last marker's tempo is held for any beats after it.
+                            if (!perf.beatGrid.empty() && perf.sampleRate > 0.0)
+                            {
+                                const double sr = perf.sampleRate;
+                                std::vector<uint16_t> nums;
+                                std::vector<uint32_t> times;
+                                nums.reserve(perf.beatGrid.size() * 4);
+                                times.reserve(perf.beatGrid.size() * 4);
+
+                                const auto& bg = perf.beatGrid;
+                                for (size_t mi = 0; mi < bg.size(); ++mi)
+                                {
+                                    const auto& m = bg[mi];
+                                    // Cap numBeats defensively: typical 4/4 grid is
+                                    // 4 per marker, unusual time signatures may use
+                                    // 8 or 16; >64 indicates corrupt data.
+                                    int n = (m.numBeats > 0 && m.numBeats <= 64) ? m.numBeats : 4;
+                                    double startSamp = m.sampleOffset;
+
+                                    // Determine the per-beat sample stride.  If
+                                    // there's a next marker, use it; otherwise
+                                    // reuse the previous stride (final region).
+                                    double stride;
+                                    if (mi + 1 < bg.size())
+                                        stride = (bg[mi + 1].sampleOffset - startSamp) / (double) n;
+                                    else if (mi > 0)
+                                    {
+                                        int prevN = (bg[mi - 1].numBeats > 0 && bg[mi - 1].numBeats <= 64)
+                                                  ? bg[mi - 1].numBeats : 4;
+                                        stride = (m.sampleOffset - bg[mi - 1].sampleOffset) / (double) prevN;
+                                    }
+                                    else
+                                        stride = sr * 0.5;   // ~120 BPM fallback
+
+                                    if (stride <= 0.0) continue;
+
+                                    for (int bi = 0; bi < n; ++bi)
+                                    {
+                                        int64_t beatIdx = m.beatNumber + (int64_t) bi;  // 1-based
+                                        if (beatIdx < 1 || beatIdx > 65535) continue;
+                                        double samp = startSamp + (double) bi * stride;
+                                        if (samp < 0.0) continue;
+                                        uint32_t timeMs = (uint32_t) (samp * 1000.0 / sr);
+                                        nums.push_back((uint16_t) beatIdx);
+                                        times.push_back(timeMs);
+                                    }
+                                }
+                                if (!nums.empty())
+                                {
+                                    sharedTcnetOutput.setLayerBeatGrid(
+                                        layer, nums.data(), times.data(), (int) nums.size());
+                                }
+                                else
+                                {
+                                    sharedTcnetOutput.setLayerBeatGrid(layer, nullptr, nullptr, 0);
+                                }
+                            }
+                            else
+                            {
+                                sharedTcnetOutput.setLayerBeatGrid(layer, nullptr, nullptr, 0);
+                            }
+                        }
+                    }
+
+                    // If we couldn't commit the key (no netPath, or no data
+                    // ready yet) AND we previously had data on this layer,
+                    // clear it so we don't leave stale waveform/beatgrid from
+                    // a previous track.  Subsequent iterations will retry
+                    // with the same wfKey until data arrives.
+                    if (!committedKey && tcnetWaveformKey[layer].isNotEmpty())
+                    {
+                        tcnetWaveformKey[layer] = {};
+                        sharedTcnetOutput.setLayerSmallWaveform(layer, nullptr, 0, 0);
                         sharedTcnetOutput.setLayerBeatGrid(layer, nullptr, nullptr, 0);
                     }
                 }

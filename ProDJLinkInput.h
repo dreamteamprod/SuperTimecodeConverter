@@ -14,13 +14,13 @@
 //   NXS2/older: Beat-derived from status (beatCount x 60000/BPM, ~5Hz)
 //
 // Phase 1: UDP monitoring + Dual-keepalive bridge
-//   - Bridge join sequence: hello 0x0A (player=5) -> IP claim 0x02 (player=0xC0)
+//   - Bridge join sequence: hello 0x0A (player=5) -> IP claim 0x02 (player=5)
 //   - Two keepalives sent in parallel:
-//     1) 54B BROADCAST (player=0xC1) -- DJM discovers bridge, activates fader delivery
+//     1) 54B BROADCAST (player=0xF9) -- DJM discovers bridge, activates fader delivery
 //     2) 95B UNICAST to each CDJ (player=5, PIONEER DJ CORP strings) -- CDJ registers
 //        us as a valid peer and sends AbsPos/Status unicast data
 //   - The DJM NEVER receives the 95B (it's unicast to CDJ IPs only)
-//     -> DJM sees single identity (0xC1) -> faders work
+//     -> DJM sees single identity (0xF9) -> faders work
 //   - The CDJ sees both, but both are from the same bridge -> no conflict
 //   - Sends type-0x57 subscribe to each DJM (port 50001)
 //     -> triggers DJM to send type-0x39 mixer fader packets
@@ -518,6 +518,7 @@ public:
         pktCountMixer.store(0, std::memory_order_relaxed);
         pktCountVU.store(0, std::memory_order_relaxed);
         pktCountDJMStatus.store(0, std::memory_order_relaxed);
+        djmOnAirLastMs.store(0, std::memory_order_relaxed);
     }
 
     //==========================================================================
@@ -1547,14 +1548,19 @@ private:
         pkt[0x0a] = 0x06;
         std::strncpy(reinterpret_cast<char*>(pkt + 0x0c), "TCS-SHOWKONTROL", 19);
         pkt[0x20] = 0x01;  pkt[0x21] = 0x01;  pkt[0x23] = 0x36;
-#ifdef __APPLE__
+        // Player number byte: the official Pioneer Bridge uses 0xF9 here on
+        // both platforms (verified against Bridge_Original.pcapng capture).
+        // Older STC builds used 0xC1 on Windows -- some DJM models (V10,
+        // 900NXS2) accepted it but the DJM-A9 firmware rejects anything but
+        // the canonical 0xF9, ignoring the 0x57 subscribe and never sending
+        // fader/VU data back.  Unifying both platforms on 0xF9 matches the
+        // reference Bridge byte-for-byte.
         pkt[0x24] = 0xF9;  pkt[0x25] = 0x00;
-#else
-        pkt[0x24] = 0xC1;  pkt[0x25] = 0x00;
-#endif
         std::memcpy(pkt + 0x26, ownMacBytes, 6);
         std::memcpy(pkt + 0x2c, ownIpBytes, 4);
-        pkt[0x30] = 0x03;  pkt[0x34] = 0x05;  pkt[0x35] = 0x20;
+        // Byte 0x30: official Bridge sends 0x04, not 0x03.  Same reason as
+        // above -- aligning with the captured reference behaviour.
+        pkt[0x30] = 0x04;  pkt[0x34] = 0x05;  pkt[0x35] = 0x20;
 
         // 1) Standard broadcast (all devices see it)
         keepaliveSock->write(broadcastIp, ProDJLink::kKeepalivePort, pkt, sizeof(pkt));
@@ -1670,10 +1676,12 @@ private:
         // claim structure matters)
         p[0x2e] = uint8_t(ownMacBytes[5] ^ uint8_t(counter * 3 + 0xFB));
         p[0x2f] = uint8_t(counter);              // counter
-        p[0x30] = 0xC0;                           // bridge claim identity
-#ifdef __APPLE__
-        p[0x30] = uint8_t(vCDJPlayerNumber);      // macOS needs player 5
-#endif
+        // [0x30] = player number being claimed.  The official Pioneer Bridge
+        // uses its actual player number (5) here on both platforms, verified
+        // against Bridge_Original.pcapng.  Older STC builds used 0xC0 on
+        // Windows, which DJM-A9 firmware rejects -- aligning with the
+        // captured reference makes the claim acceptable to all DJM models.
+        p[0x30] = uint8_t(vCDJPlayerNumber);
         p[0x31] = 0x00;
         keepaliveSock->write(broadcastIp, ProDJLink::kKeepalivePort, p, sizeof(p));
     }
@@ -1767,6 +1775,10 @@ private:
                 if (pn < 1 || pn > 6) continue;
                 players[i].isOnAir.store(chOnAir[pn - 1], std::memory_order_relaxed);
             }
+            // Mark that we have a DJM-sourced on-air signal so the CDJ
+            // self-reported flag is suppressed in the status handler.
+            djmOnAirLastMs.store(juce::Time::getMillisecondCounter(),
+                                  std::memory_order_relaxed);
         }
 
         DBG("ProDJLink: 0x03 on-air broadcast ch1=" << (int)chOnAir[0] << " ch2=" << (int)chOnAir[1]
@@ -2248,7 +2260,19 @@ private:
         if (len > 137)
         {
             uint16_t flags = ProDJLink::readU16BE(data + 136);
-            p.isOnAir.store((flags & 0x08) != 0, std::memory_order_relaxed);
+            // The CDJ's own on-air bit (0x08) is gated by its UTILITY -> "On
+            // Air Display" setting -- when the DJ disables that, the bit goes
+            // to 0 even when the channel is genuinely on-air at the mixer.
+            // The DJM's own report (0x03 broadcast or 0x29 unicast) is the
+            // authoritative source.  If we've heard from the DJM in the last
+            // 5 seconds we trust it exclusively and skip writing isOnAir from
+            // the CDJ status, otherwise the two writers race and the flag
+            // visibly flickers.
+            const uint32_t now      = juce::Time::getMillisecondCounter();
+            const uint32_t lastDjm  = djmOnAirLastMs.load(std::memory_order_relaxed);
+            const bool     djmFresh = (lastDjm != 0) && ((now - lastDjm) < 5000u);
+            if (! djmFresh)
+                p.isOnAir.store((flags & 0x08) != 0, std::memory_order_relaxed);
             p.isMaster.store((flags & 0x20) != 0, std::memory_order_relaxed);
             p.isPlaying.store((flags & 0x40) != 0, std::memory_order_relaxed);
         }
@@ -2941,6 +2965,10 @@ private:
         }
 
         pktCountDJMStatus.fetch_add(1, std::memory_order_relaxed);
+        // Mark that we have a DJM-sourced on-air signal so the CDJ
+        // self-reported flag is suppressed in the status handler.
+        djmOnAirLastMs.store(juce::Time::getMillisecondCounter(),
+                              std::memory_order_relaxed);
 
         DBG("ProDJLink: 0x29 on-air ch1=" << (int)chOnAir[0] << " ch2=" << (int)chOnAir[1]
             << " ch3=" << (int)chOnAir[2] << " ch4=" << (int)chOnAir[3]);
@@ -2990,6 +3018,15 @@ private:
     std::atomic<uint32_t> pktCountStatus     { 0 };
     std::atomic<uint32_t> pktCountMixer      { 0 };
     std::atomic<uint32_t> pktCountDJMStatus  { 0 };  // type 0x29 packets received
+    // Timestamp (juce::Time::getMillisecondCounter) of the most recent on-air
+    // update from a DJM-sourced packet (0x03 broadcast OR 0x29 unicast).
+    // The CDJ status (0x0a) also reports an on-air bit, but that bit reflects
+    // the CDJ's "On Air Display" setting in its own UTILITY menu -- when the
+    // user switches that off, the CDJ's bit goes to 0 even though the channel
+    // is genuinely on-air.  Two writers racing for the same isOnAir variable
+    // produces visible flicker.  When this timestamp is recent we trust the
+    // DJM exclusively and ignore the CDJ-self-reported bit.
+    std::atomic<uint32_t> djmOnAirLastMs    { 0 };
 
     // DJM mixer state (from type 0x39 packets, 248+ bytes)
     // --- Per-channel arrays (indexed 0-5 for CH1-CH6) ---

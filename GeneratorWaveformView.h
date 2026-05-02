@@ -216,6 +216,34 @@ private:
                        juce::Justification::centredLeft, false);
         }
 
+        // --- Cue markers (drawn before the cursor so the cursor stays
+        // visible on top when it crosses a cue) ---
+        if (engine != nullptr)
+        {
+            const auto& cues   = engine->getRawGeneratorCues();
+            const double startMs = engine->getGeneratorStartMs();
+            const double fps    = frameRateToDouble(engine->getCurrentFps());
+            for (const auto& gc : cues)
+            {
+                // Project the cue's absolute TC onto the audio file
+                // timeline.  Cues that fall outside [startMs, startMs +
+                // audioLength*1000] just don't have a visible marker --
+                // they still fire correctly at runtime; this is purely
+                // a visual.
+                const double cuePosMs = (double) gc.positionMs(fps);
+                const double posSec   = (cuePosMs - startMs) / 1000.0;
+                if (posSec < 0.0 || posSec > totalLen) continue;
+
+                const int cueX = waveArea.getX()
+                               + (int)((posSec / totalLen) * waveArea.getWidth());
+                // Subtle white-ish vertical line so it's visible against
+                // both the blue waveform and the dark background, but
+                // dimmer than the playback cursor (which uses cursorCol).
+                g.setColour(juce::Colour(0xCCCCCCCC));
+                g.fillRect(cueX, waveArea.getY(), 1, waveArea.getHeight());
+            }
+        }
+
         // --- Cursor (drawn last so it stays visible over ticks) ---
         if (engine != nullptr)
         {

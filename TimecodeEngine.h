@@ -138,6 +138,21 @@ public:
         activeInput = source;
         sourceActive = false;
 
+        // Releasing the Generator audio output device when the engine
+        // switches to a non-Generator input is important for shows where
+        // multiple engines might want to share the same physical output.
+        // Without this, an engine that previously had AUDIO PLAYBACK on
+        // would keep its device open even after the user switched its
+        // input to MTC / LTC / etc., effectively locking that device out
+        // of any other engine's selector even though no playback is or
+        // ever could be happening on this engine again.
+        //
+        // The toggle button state and persisted settings are NOT touched:
+        // if the user switches the input back to the Generator later, the
+        // device opens again exactly as it was, transparent to them.
+        if (source != InputSource::SystemTime && generatorAudioPlayer.isDeviceOpen())
+            generatorAudioPlayer.closeDevice();
+
         // Reset TrackMap cache when leaving ProDJLink / StageLinQ
         if (source != InputSource::ProDJLink && source != InputSource::StageLinQ)
         {
@@ -155,6 +170,17 @@ public:
                 linkBridge.setEnabled(false);
         }
 
+        // Clear armed cues whenever the input source changes.  The list
+        // was populated by either a TrackMap entry (ProDJLink / StageLinQ)
+        // or a Generator preset (SystemTime); leaving any of them, the old
+        // entries are no longer valid and would fire spuriously against
+        // unrelated playhead values.  MainComponent will repopulate via
+        // setGeneratorCuePoints() when the new source is SystemTime with
+        // a preset selected.
+        armedCues.clear();
+        rawGeneratorCues.clear();
+        lastCueCheckMs = 0;
+
         // Note: actual start is deferred to the caller (MainComponent),
         // which gathers device params from UI before calling startXxxInput().
         if (source == InputSource::SystemTime)
@@ -166,12 +192,20 @@ public:
 
     void setFrameRate(FrameRate fps)
     {
+        const bool fpsChanged = (currentFps != fps);
         currentFps = fps;
         FrameRate outRate = getEffectiveOutputFps();
         mtcOutput.setFrameRate(outRate);
         artnetOutput.setFrameRate(outRate);
         ltcOutput.setFrameRate(outRate);
         hippotizerOutput.setFrameRate(outRate);
+
+        // Re-derive Generator armed cues with the new fps so the frame
+        // component of each cue's TC maps to the right absolute-ms.  Only
+        // matters when there is an active Generator preset; the TrackMap
+        // armed cues use ms directly and don't need rearming here.
+        if (fpsChanged && ! rawGeneratorCues.empty())
+            rearmGeneratorCues();
     }
 
     void setUserOverrodeLtcFps(bool v) { userOverrodeLtcFps = v; }
@@ -315,14 +349,15 @@ public:
     void setDbServerClient(DbServerClient* client) { dbClient = client; }
     int  getProDJLinkPlayer() const     { return proDJLinkPlayer; }
     /// Returns the physical player (1-6) actually being followed.
-    /// In fixed mode: same as proDJLinkPlayer. In XF mode: the resolved player.
+    /// Fixed mode: same as proDJLinkPlayer.
+    /// XF / MASTER mode: the dynamically resolved player.
     int  getEffectivePlayer() const
     {
-        return isXfMode() ? resolvedXfPlayer : proDJLinkPlayer;
+        return isAutoMode() ? resolvedXfPlayer : proDJLinkPlayer;
     }
     void setProDJLinkPlayer(int p)
     {
-        proDJLinkPlayer = juce::jlimit(1, kPlayerXfB, p);
+        proDJLinkPlayer = juce::jlimit(1, kPlayerMaster, p);
         resolvedXfPlayer = 0;  // force re-resolve on next tick
         resetProDJLinkCache();
         bpmPlayerOverride = kBpmNoOverride;
@@ -463,7 +498,7 @@ public:
         // LTC direct mode is now toggled dynamically per tick
         // (direct in transient, auto-increment in stable)
 
-        proDJLinkPlayer = juce::jlimit(1, kPlayerXfB, player);
+        proDJLinkPlayer = juce::jlimit(1, kPlayerMaster, player);
         resolvedXfPlayer = 0;  // force resolve on first tick
 
         // NOTE: lastSeenTrackVersion stays at 0 (set by resetProDJLinkCache).
@@ -509,7 +544,7 @@ public:
 
         // NOTE: do NOT overwrite currentFps here (see startProDJLinkInput).
 
-        proDJLinkPlayer = juce::jlimit(1, kPlayerXfB, player);
+        proDJLinkPlayer = juce::jlimit(1, kPlayerMaster, player);
         resolvedXfPlayer = 0;
 
         // NOTE: lastSeenTrackVersion stays at 0 (set by resetProDJLinkCache).
@@ -1006,17 +1041,21 @@ public:
             case InputSource::ProDJLink:
                 if (sharedProDJLink != nullptr && sharedProDJLink->getIsRunning())
                 {
-                    // --- XF-A/XF-B auto-follow: resolve physical player ---
-                    if (isXfMode())
-                        resolveXfPlayer();
+                    // --- XF / MASTER auto-follow: resolve physical player ---
+                    if (isXfMode())          resolveXfPlayer();
+                    else if (isMasterMode()) resolveMasterPlayer();
                     const int ep = getEffectivePlayer();
                     if (ep < 1 || ep > ProDJLink::kMaxPlayers)
                     {
                         sourceActive = false;
                         if (statusTextVisible)
                         {
-                            juce::String sideLabel = (proDJLinkPlayer == kPlayerXfA) ? "XF-A" : "XF-B";
-                            inputStatusText = sideLabel + ": NO PLAYER ON SIDE";
+                            const char* label =
+                                isMasterMode() ? "MASTER"
+                                : (proDJLinkPlayer == kPlayerXfA ? "XF-A" : "XF-B");
+                            inputStatusText = juce::String(label)
+                                + (isMasterMode() ? ": NO MASTER PLAYER"
+                                                  : ": NO PLAYER ON SIDE");
                         }
                         break;
                     }
@@ -1318,10 +1357,13 @@ public:
                             if (pdlHasTC)
                             {
                                 juce::String pdlModel = sharedProDJLink->getPlayerModel(ep);
-                                inputStatusText = isXfMode()
-                                    ? ((proDJLinkPlayer == kPlayerXfA ? "XF-A" : "XF-B")
-                                       + juce::String(" P") + juce::String(ep))
-                                    : ("RX P" + juce::String(ep));
+                                if (isMasterMode())
+                                    inputStatusText = "MASTER P" + juce::String(ep);
+                                else if (isXfMode())
+                                    inputStatusText = (proDJLinkPlayer == kPlayerXfA ? "XF-A" : "XF-B")
+                                                      + juce::String(" P") + juce::String(ep);
+                                else
+                                    inputStatusText = "RX P" + juce::String(ep);
                                 if (pdlModel.isNotEmpty())
                                     inputStatusText += " " + pdlModel;
 
@@ -1817,7 +1859,15 @@ public:
 
         const bool wasStopped = (genState == GeneratorState::Stopped);
         if (wasStopped)
+        {
             genCurrentMs = genStartMs;  // reset to start TC
+            // Sync the cue cursor too: the (prev, now] window for the very
+            // first cue check after play-from-stopped should begin at
+            // startMs, otherwise a leftover lastCueCheckMs from a previous
+            // session could either skip cues or produce a backward-jump
+            // false positive.
+            lastCueCheckMs = (uint32_t) juce::jmax(0.0, genStartMs);
+        }
         genLastTickTime = juce::Time::getMillisecondCounterHiRes();
         genState = GeneratorState::Playing;
 
@@ -1849,6 +1899,11 @@ public:
     {
         genState = GeneratorState::Stopped;
         genCurrentMs = genStartMs;
+        // Reset the crossing-based cue cursor too -- the next play will
+        // start from genStartMs and we want the first tick's (prev, now]
+        // window to begin at startMs, not at the position the previous
+        // play session ended at.
+        lastCueCheckMs = (uint32_t) juce::jmax(0.0, genStartMs);
         if (activeInput == InputSource::SystemTime)
             currentTimecode = wallClockToTimecode(genCurrentMs, currentFps);
         generatorAudioPlayer.stopAndReset();
@@ -1868,6 +1923,60 @@ public:
     /// Set stop timecode in ms from midnight. 0 = no stop (freerun).
     void setGeneratorStopMs(double ms) { genStopMs = juce::jmax(0.0, ms); }
 
+    /// Load Generator preset cues into the engine's armed-cue list.  Cue
+    /// positions are converted from SMPTE TC strings to absolute ms (using
+    /// the engine's current fps) so the existing tickCuePoints logic --
+    /// originally written for TrackMap CDJ playhead in ms -- can be reused
+    /// without modification.  Pass an empty vector to clear armed cues.
+    ///
+    /// The raw cue list is cached so a later setFrameRate() can rearm them
+    /// with the new fps without the caller having to push the cues again.
+    void setGeneratorCuePoints(const std::vector<GeneratorCuePoint>& cues)
+    {
+        rawGeneratorCues = cues;
+        rearmGeneratorCues();
+    }
+
+private:
+    /// Re-derive armedCues from rawGeneratorCues using currentFps.  Called
+    /// by setGeneratorCuePoints (initial load) and setFrameRate (so a fps
+    /// change recomputes the absolute-ms positions, which depend on fps in
+    /// the frame component of HH:MM:SS:FF).
+    void rearmGeneratorCues()
+    {
+        armedCues.clear();
+        lastCueCheckMs = 0;
+        if (rawGeneratorCues.empty()) return;
+
+        armedCues.reserve(rawGeneratorCues.size());
+        for (auto& gc : rawGeneratorCues)
+        {
+            ArmedCue ac;
+            // Project the GeneratorCuePoint onto a plain CuePoint so the
+            // shared dispatch code (triggerOutput.fireCuePoint, the
+            // Art-Net path in tickCuePoints) doesn't need to know about
+            // GeneratorCuePoint at all.
+            ac.cue.positionMs  = gc.positionMs(frameRateToDouble(currentFps));
+            ac.cue.name        = gc.name;
+            ac.cue.midiChannel = gc.midiChannel;
+            ac.cue.midiNoteNum = gc.midiNoteNum;
+            ac.cue.midiNoteVel = gc.midiNoteVel;
+            ac.cue.midiCCNum   = gc.midiCCNum;
+            ac.cue.midiCCVal   = gc.midiCCVal;
+            ac.cue.oscAddress  = gc.oscAddress;
+            ac.cue.oscArgs     = gc.oscArgs;
+            ac.cue.artnetCh    = gc.artnetCh;
+            ac.cue.artnetVal   = gc.artnetVal;
+            ac.fired = false;
+            armedCues.push_back(std::move(ac));
+        }
+        std::sort(armedCues.begin(), armedCues.end(),
+                  [](const ArmedCue& a, const ArmedCue& b)
+                  { return a.cue.positionMs < b.cue.positionMs; });
+    }
+
+public:
+
     /// Seek the generator to a specific position (in ms from midnight) and
     /// resync the attached audio file.  State transitions:
     ///   Playing -> Playing (audio keeps playing from new pos)
@@ -1883,6 +1992,14 @@ public:
         genCurrentMs    = juce::jmax(0.0, newMs);
         genLastTickTime = juce::Time::getMillisecondCounterHiRes();
 
+        // Sync the cue check cursor to the seek destination so the next
+        // crossing-based tick treats anything <= newMs as "already on the
+        // wrong side" and won't fire it.  This is what makes "seek to a
+        // cue and play" not retrigger the cue: the cue's positionMs is
+        // equal to lastCueCheckMs, and the (prev, now] window is strict
+        // on the lower bound.
+        lastCueCheckMs = (uint32_t) juce::jmax(0.0, genCurrentMs);
+
         if (genState == GeneratorState::Stopped)
             genState = GeneratorState::Paused;
 
@@ -1896,6 +2013,16 @@ public:
     double getGeneratorStartMs() const { return genStartMs; }
     double getGeneratorStopMs()  const { return genStopMs; }
     double getGeneratorCurrentMs() const { return genCurrentMs; }
+
+    /// Read-only view of the Generator preset's currently armed cues.
+    /// Empty when no preset is active or input source is not SystemTime.
+    /// The list is mutated by setGeneratorCuePoints / clearing the input
+    /// source change, so consumers should re-read on every paint rather
+    /// than hold onto the reference across frames.
+    const std::vector<GeneratorCuePoint>& getRawGeneratorCues() const
+    {
+        return rawGeneratorCues;
+    }
 
     /// Clock mode: read wall clock (old SystemTime behavior) instead of generator transport.
     void setGeneratorClockMode(bool useSystemClock)
@@ -2119,12 +2246,15 @@ private:
     DbServerClient* dbClient       = nullptr;  // shared across engines (Phase 2)
     int             proDJLinkPlayer = 1;        // per-engine player selection (1..6, 7=XF-A, 8=XF-B)
 
-    // Crossfader auto-follow (XF-A / XF-B mode)
-    static constexpr int kPlayerXfA = 7;        // auto-follow crossfader side A
-    static constexpr int kPlayerXfB = 8;        // auto-follow crossfader side B
-    int  resolvedXfPlayer = 0;                  // physical player (1-4) currently followed in XF mode
+    // Crossfader auto-follow (XF-A / XF-B mode) and Master auto-follow.
+    static constexpr int kPlayerXfA    = 7;        // auto-follow crossfader side A
+    static constexpr int kPlayerXfB    = 8;        // auto-follow crossfader side B
+    static constexpr int kPlayerMaster = 9;        // auto-follow whichever player has DJM master
+    int  resolvedXfPlayer = 0;                  // physical player (1-4) currently followed in XF / MASTER mode
 
-    bool isXfMode() const { return proDJLinkPlayer >= kPlayerXfA; }
+    bool isXfMode() const     { return proDJLinkPlayer == kPlayerXfA || proDJLinkPlayer == kPlayerXfB; }
+    bool isMasterMode() const { return proDJLinkPlayer == kPlayerMaster; }
+    bool isAutoMode() const   { return isXfMode() || isMasterMode(); }
 
     /// Resolve which physical player to follow in XF-A/XF-B mode.
     /// Sticky: stays on current player while it has on-air flag.
@@ -2183,6 +2313,43 @@ private:
             pll.reset(); clearBeatGrid(); pdlTcFrozen = false; pdlLastPlayheadMs = 0; pdlLastAbsPosTs = 0.0;
             pdlSnapMs = 0.0; pdlSnapTime = 0.0; pdlSnapSpeed = 1.0;
         }
+    }
+
+    /// Resolve which physical player to follow in MASTER mode.
+    /// Sticky: stays on the current master while it remains master.
+    /// When a new player becomes master, switch to it.
+    /// Falls back to whichever player most recently held master if no player
+    /// currently has the flag (rare, brief gaps during track loads).
+    void resolveMasterPlayer()
+    {
+        if (!sharedProDJLink) return;
+
+        // Sticky: keep current player if it still holds master.
+        if (resolvedXfPlayer >= 1 && resolvedXfPlayer <= 6
+            && sharedProDJLink->isPlayerMaster(resolvedXfPlayer))
+        {
+            return;
+        }
+
+        // Find the player that currently holds master.
+        for (int ch = 1; ch <= 6; ++ch)
+        {
+            if (sharedProDJLink->isPlayerMaster(ch))
+            {
+                switchResolvedPlayer(ch);
+                return;
+            }
+        }
+
+        // No player currently reports master.  Keep the previous one (the
+        // master flag often goes briefly low during track load); the next
+        // tick will pick up the new master once it's announced.
+        if (resolvedXfPlayer >= 1 && resolvedXfPlayer <= 6)
+            return;
+
+        // First tick with no master ever seen -- nothing to follow yet.
+        // resolvedXfPlayer stays 0 and the engine will idle until a master
+        // appears.
     }
 
     /// Resolve XF-A/XF-B for StageLinQ.  Same sticky logic as ProDJLink.
@@ -2582,6 +2749,11 @@ private:
         bool     fired = false;
     };
     std::vector<ArmedCue> armedCues;
+    // Raw cue list for the Generator path, kept so a frame-rate change
+    // can re-derive armedCues with the new fps (the frame-component of
+    // each cue's TC contributes a fps-dependent ms offset).  Empty when
+    // no Generator preset is active or a TrackMap cue load took over.
+    std::vector<GeneratorCuePoint> rawGeneratorCues;
     uint32_t lastCueCheckMs = 0;   // last playhead position used for cue check (seek detection)
     juce::String oscFwdBpmAddr = "/composition/tempocontroller/tempo";
     juce::String oscFwdBpmCmd;  // e.g. "Master 3.x at %BPM%" -- if non-empty, sends string instead of float
@@ -2920,6 +3092,11 @@ private:
     void loadCuePointsForTrack(const TrackMapEntry* entry)
     {
         armedCues.clear();
+        // The Generator and TrackMap cue paths share armedCues but only
+        // one of them is active at any time.  Clear the Generator's raw
+        // cache here so a later setFrameRate() can't rearm leftover
+        // Generator cues on top of a TrackMap-driven session.
+        rawGeneratorCues.clear();
         lastCueCheckMs = 0;
 
         if (!entry || entry->cuePoints.empty()) return;
@@ -2992,6 +3169,68 @@ private:
         lastCueCheckMs = playheadMs;
     }
 
+    /// Crossing-based cue dispatch for the Generator.
+    ///
+    /// Different semantics from tickCuePoints (which is the TrackMap path):
+    /// here a cue fires every time the playhead is observed to advance
+    /// across the cue position -- specifically when prevMs < cue <= nowMs.
+    /// There is no `fired` flag and the order of cues is otherwise
+    /// irrelevant; we just walk all armed cues and trigger those that
+    /// fall in the (prev, now] half-open window.
+    ///
+    /// What this gets us:
+    ///   - Seek backward and play forward -> cues are crossed again and fire
+    ///     each time, which is the natural "rehearse this section again"
+    ///     behaviour the user asked for.
+    ///   - Seek to exactly a cue position and play -> the cue is NOT fired,
+    ///     because the next tick advances *past* it without crossing into it
+    ///     (the cue's positionMs equals the previous mark, which is excluded
+    ///     by the strict-less comparison).
+    ///   - Looping audio that wraps the TC backward -> every loop iteration
+    ///     re-fires the cues inside the loop region.
+    ///   - Backward jumps (seek, loop wrap, stop+restart) just update
+    ///     prevMs without firing anything.
+    void tickCuePointsCrossing(uint32_t playheadMs)
+    {
+        if (armedCues.empty()) { lastCueCheckMs = playheadMs; return; }
+
+        const uint32_t prevMs = lastCueCheckMs;
+
+        // Backward jump: just take the new mark, don't fire anything.  This
+        // covers seek-back, audio loop wrap, and stop->start (which leaves
+        // genCurrentMs at startMs, often less than where it was before).
+        if (playheadMs <= prevMs) { lastCueCheckMs = playheadMs; return; }
+
+        // Forward advance.  Fire any cue whose position is strictly greater
+        // than where we were and at most where we are now.
+        for (auto& ac : armedCues)
+        {
+            const uint32_t pos = ac.cue.positionMs;
+            if (pos <= prevMs)     continue;  // already behind; not crossed this tick
+            if (pos >  playheadMs) continue;  // still ahead; not crossed this tick
+
+            triggerOutput.fireCuePoint(ac.cue);
+
+            if (artnetTriggerEnabled && ac.cue.hasArtnetTrigger() && artnetOutput.getIsRunning())
+            {
+                int ch = ac.cue.artnetCh;
+                if (ch > 0 && ch <= 512)
+                {
+                    trigDmxBuffer[ch - 1] = uint8_t(ac.cue.artnetVal);
+                    if (ch > trigDmxHighWater) trigDmxHighWater = ch;
+                    artnetOutput.sendDmxFrame(trigDmxBuffer, trigDmxHighWater,
+                                              artnetTriggerUniverse);
+                }
+            }
+
+            DBG("TimecodeEngine: Generator cue fired '" + ac.cue.name + "' at "
+                + CuePoint::formatPositionMs(pos)
+                + " (playhead=" + CuePoint::formatPositionMs(playheadMs) + ")");
+        }
+
+        lastCueCheckMs = playheadMs;
+    }
+
     //--------------------------------------------------------------------------
     void updateGenerator()
     {
@@ -3023,6 +3262,16 @@ private:
                 genState = GeneratorState::Stopped;
                 generatorAudioPlayer.stopAndReset();
             }
+
+            // Check armed cue points against the current generated TC.
+            // Uses the crossing-based variant: a cue fires whenever the
+            // generated TC advances across its position in play.  Seeking
+            // backwards and playing forward will re-fire cues, looping
+            // audio re-fires cues every iteration -- which is what the
+            // Generator's transport-mode UX wants (vs. the TrackMap path
+            // where each cue fires at most once per track to match how a
+            // CDJ scratch / jog should behave).
+            tickCuePointsCrossing((uint32_t) juce::jmax(0.0, genCurrentMs));
         }
         // Stopped and Paused: genCurrentMs stays where it is
         currentTimecode = wallClockToTimecode(genCurrentMs, currentFps);

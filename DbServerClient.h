@@ -957,7 +957,21 @@ private:
                 msg.strArgs[i] = arg.stringValue;
             if (arg.type == 0x14 && arg.blobData.getSize() > 0)
                 msg.blobArgs[i] = std::move(arg.blobData);
-            lastArg = arg;
+
+            // The next-iteration safety check (zero-length blob detection)
+            // only needs lastArg.type, lastArg.numericValue, and lastArg.ok.
+            // Do NOT copy `arg` whole here: when the branch above moved
+            // arg.blobData out, JUCE's MemoryBlock move-assignment leaves
+            // arg.blobData with data=nullptr but size=originalSize, so a
+            // subsequent copy-assignment of the MemoryBlock would call
+            // memcpy(dst, nullptr, size) inside MemoryBlock::operator=,
+            // crashing the whole dbserver worker thread.  Manifests when
+            // reading any blob field (artwork JPEG, ANLZ waveform tags,
+            // etc.) -- exactly the path that loads images in the PDL view.
+            lastArg = FieldResult{};
+            lastArg.type         = arg.type;
+            lastArg.numericValue = arg.numericValue;
+            lastArg.ok           = arg.ok;
         }
 
         msg.ok = true;

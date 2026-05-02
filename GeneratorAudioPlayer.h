@@ -35,26 +35,45 @@ class GeneratorAudioPlayer : private juce::AudioIODeviceCallback
 public:
     GeneratorAudioPlayer()
     {
-        formatManager.registerBasicFormats();   // WAV, AIFF, FLAC, OGG (+ MP3 if JUCE_USE_MP3AUDIOFORMAT was set in Projucer)
-       #if JUCE_USE_MP3AUDIOFORMAT
-        // Belt and braces: register MP3 explicitly even though
-        // registerBasicFormats() already includes it.  Duplicate registration
-        // is harmless -- createReaderFor returns the first format that
-        // accepts the extension.
-        formatManager.registerFormat(new juce::MP3AudioFormat(), false);
-       #endif
+        // Registers WAV, AIFF, FLAC, OGG, and -- when the Projucer flag
+        // JUCE_USE_MP3AUDIOFORMAT is set -- MP3.  Do NOT re-register MP3
+        // explicitly afterwards; JUCE_DEBUG asserts on duplicate format
+        // registration (jassertfalse in AudioFormatManager::registerFormat).
+        formatManager.registerBasicFormats();
     }
 
     ~GeneratorAudioPlayer() override
     {
-        // Stop the loader thread first so it cannot fire a new load against
-        // members we are about to tear down.  (Belt and braces: the
-        // LoaderThread destructor also does this on its own destruction,
-        // but doing it explicitly here means the closeDevice / unloadFile
-        // calls that follow run with no concurrent file I/O.)
+        // Order matters here.  Members are destroyed in reverse declaration
+        // order, which means the std::atomic<> flags (deviceOpen, userPaused,
+        // shouldPlay, fileLoadedAtomic, ...) are torn down BEFORE the
+        // deviceManager.  If the audio device had any callback still in
+        // flight when ~AudioDeviceManager() runs, that callback would read
+        // already-destroyed atomics -- the std::atomic load crash on shutdown
+        // we hunted in v1.9.7/v1.9.8.
+        //
+        // Step 1: latch shuttingDown so any in-flight or imminent audio
+        // callback returns immediately without touching other atomics.
+        // The acquire/release pairing on shuttingDown ensures the callback
+        // sees the flag if it observes the store.
+        shuttingDown.store(true, std::memory_order_release);
+
+        // Step 2: closeDevice() calls removeAudioCallback, which JUCE
+        // documents as blocking until any in-flight callback returns.  We
+        // call it explicitly here (rather than relying on the deviceManager
+        // destructor) so the audio thread is provably idle BEFORE we leave
+        // the user-defined destructor body and member destruction begins.
+        // The loader thread is stopped first because its tick can call back
+        // into transport / reader objects that closeDevice will tear down.
         loaderThread.stop();
         closeDevice();
         unloadFile();
+        // Belt-and-braces: ensure the AudioDeviceManager is fully closed
+        // and has no callbacks attached.  closeDevice already did this for
+        // the case where a device was open, but this also covers the path
+        // where ~GeneratorAudioPlayer runs without ever having opened one.
+        deviceManager.removeAudioCallback(this);
+        deviceManager.closeAudioDevice();
     }
 
     //==========================================================================
@@ -575,6 +594,14 @@ private:
             if (outputChannelData[ch])
                 std::memset(outputChannelData[ch], 0, sizeof(float) * (size_t) numSamples);
 
+        // Shutting-down guard: if our destructor has latched this flag, we
+        // return immediately without touching any other atomic / object.
+        // This makes the callback's lifetime trivially safe even if some
+        // exotic driver path delivers a final tick after removeAudioCallback
+        // has been issued (which JUCE itself protects against on most
+        // backends, but a single atomic load is cheap insurance).
+        if (shuttingDown.load(std::memory_order_acquire)) return;
+
         if (userPaused.load(std::memory_order_acquire)) return;
         if (! transport.isPlaying()) return;
         if (! fileLoadedAtomic.load(std::memory_order_acquire)) return;
@@ -659,6 +686,8 @@ private:
 
     void audioDeviceAboutToStart(juce::AudioIODevice* device) override
     {
+        if (shuttingDown.load(std::memory_order_acquire)) return;
+
         if (device)
         {
             currentSampleRate    = device->getCurrentSampleRate();
@@ -675,6 +704,8 @@ private:
 
     void audioDeviceStopped() override
     {
+        if (shuttingDown.load(std::memory_order_acquire)) return;
+
         const juce::ScopedLock sl(transportLock);
         transport.releaseResources();
     }
@@ -696,6 +727,7 @@ private:
     juce::AudioBuffer<float> scratchBuffer;
 
     std::atomic<bool> deviceOpen      { false };
+    std::atomic<bool> shuttingDown    { false };  // set in dtor before closeDevice; audio callback returns immediately if true
     std::atomic<int>  selectedChannel { -1 };
     std::atomic<bool> loopFlag        { false };
     std::atomic<bool> userPaused      { false };  // logical pause state -- see pause() comment

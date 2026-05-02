@@ -5,6 +5,7 @@
 #pragma once
 #include <JuceHeader.h>
 #include "AppSettings.h"
+#include "GeneratorCuePointEditor.h"
 
 //==============================================================================
 // GeneratorPresetEditor -- Table editor for named timecode generator presets.
@@ -51,13 +52,28 @@ public:
         addBtn(btnAdd,      "Add");
         addBtn(btnSave,     "Save");
         addBtn(btnDelete,   "Delete");
+        addBtn(btnCues,     "Cues...");
         addBtn(btnClearAll, "Clear All");
         addBtn(btnImport,   "Import");
         addBtn(btnExport,   "Export");
         addBtn(btnOscHelp,  "OSC ?");
 
+        btnAdd.setTooltip("Create a new preset from the form fields. "
+                          "If a preset with the same name already exists, "
+                          "the new one is auto-numbered (e.g. \"My preset (2)\").");
+        btnSave.setTooltip("Update the selected preset with the current form fields. "
+                           "You can rename it by editing the Name field. "
+                           "Disabled until a preset is selected -- use Add to create a new one.");
+        btnDelete.setTooltip("Delete the selected preset. Disabled until a preset is selected.");
+        btnCues.setTooltip("Edit cue points for the selected preset. "
+                           "Cue points fire MIDI / OSC / Art-Net triggers when the generated TC "
+                           "reaches their position. Disabled until a preset is selected.");
+
         btnSave.setColour(juce::TextButton::buttonColourId, juce::Colour(0xFF22AA44).withAlpha(0.3f));
         btnSave.setColour(juce::TextButton::textColourOffId, juce::Colour(0xFF22DD55));
+
+        btnCues.setColour(juce::TextButton::buttonColourId, juce::Colour(0xFFAA8800).withAlpha(0.3f));
+        btnCues.setColour(juce::TextButton::textColourOffId, juce::Colour(0xFFFFCC44));
 
         btnImport.setColour(juce::TextButton::buttonColourId, juce::Colour(0xFF2244AA).withAlpha(0.3f));
         btnImport.setColour(juce::TextButton::textColourOffId, juce::Colour(0xFF4488FF));
@@ -69,6 +85,7 @@ public:
         btnAdd.onClick    = [this] { addNewPreset(); };
         btnSave.onClick   = [this] { saveSelectedPreset(); };
         btnDelete.onClick = [this] { deleteSelected(); };
+        btnCues.onClick   = [this] { openCueEditor(); };
         btnClearAll.onClick = [this] { clearAll(); };
         btnImport.onClick  = [this] { importPresets(); };
         btnExport.onClick  = [this] { exportPresets(); };
@@ -114,14 +131,55 @@ public:
         btnLoopAudio.setButtonText("Loop audio file when it ends");
         btnLoopAudio.setColour(juce::ToggleButton::textColourId, textBright);
 
-        edName.onReturnKey    = [this] { saveSelectedPreset(); };
-        edStartTC.onReturnKey = [this] { saveSelectedPreset(); };
-        edStopTC.onReturnKey  = [this] { saveSelectedPreset(); };
+        // Enter on any form field commits the form.  If a preset is
+        // selected, Enter saves it (matches the natural reading of "I'm
+        // editing this preset, finish editing"); otherwise Enter creates
+        // a new preset (matches "I just typed a name, add it").  This
+        // avoids the surprise where Enter silently does nothing when there
+        // is no selection.
+        auto commitForm = [this]
+        {
+            if (table.getSelectedRow() >= 0
+                && table.getSelectedRow() < (int)rows.size())
+                saveSelectedPreset();
+            else
+                addNewPreset();
+        };
+        edName.onReturnKey    = commitForm;
+        edStartTC.onReturnKey = commitForm;
+        edStopTC.onReturnKey  = commitForm;
+
+        updateStopTCEnabledState();
+        updateButtonStates();
     }
 
     ~GeneratorPresetEditor() override = default;
 
     std::function<void()> onChange;
+
+    /// Set the engine's current fps so the cue editor can convert cue TC
+    /// to ms (and back) consistently.  Called by MainComponent whenever
+    /// the editor is opened or the engine's fps changes.
+    void setCurrentFpsForCueEditor(double fpsValue)
+    {
+        if (fpsValue > 0.0) currentFpsForCueEditor = fpsValue;
+    }
+
+    /// Install a playhead getter that the cue editor (when opened) will
+    /// poll at ~30Hz to drive the live playback cursor in the waveform
+    /// strip.  Returns ms-from-audio-start (i.e. corrected for the
+    /// preset's startTC) or a negative value when nothing is playing.
+    /// Pass empty std::function to disable.
+    void setPlayheadGetter(std::function<int64_t()> getter)
+    {
+        playheadGetter = std::move(getter);
+        // If a cue editor is already open, push the new getter to it
+        // immediately so toggling playback feedback doesn't require
+        // closing and reopening the cue window.
+        if (cueWindow != nullptr)
+            if (auto* ed = cueWindow->getEditor())
+                ed->setPlayheadGetter(playheadGetter);
+    }
 
     //--------------------------------------------------------------------------
     // TableListBoxModel
@@ -141,14 +199,21 @@ public:
         if (rowNumber < 0 || rowNumber >= (int)rows.size()) return;
         auto& p = rows[(size_t)rowNumber];
 
-        g.setColour(textBright);
+        // When the preset carries an audio file, the Stop TC field is
+        // ignored at runtime in favour of the file's actual length.  Render
+        // it muted in the list so the user sees that the stored value is
+        // not the one being applied.
+        const bool stopOverriddenByAudio = (columnId == ColStop) && p.audioFilePath.isNotEmpty();
+        g.setColour(stopOverriddenByAudio ? textMid : textBright);
         g.setFont(juce::Font(juce::FontOptions(11.0f)));
         juce::String text;
         switch (columnId)
         {
             case ColName:  text = p.name;    break;
             case ColStart: text = p.startTC; break;
-            case ColStop:  text = p.stopTC;  break;
+            case ColStop:
+                text = stopOverriddenByAudio ? juce::String("(audio length)") : p.stopTC;
+                break;
             case ColAudio:
                 if (p.audioFilePath.isNotEmpty())
                 {
@@ -170,7 +235,51 @@ public:
             edStopTC.setText(p.stopTC, false);
             edAudio.setText(p.audioFilePath, false);
             btnLoopAudio.setToggleState(p.audioLoop, juce::dontSendNotification);
+            updateStopTCEnabledState();
         }
+        // If the cue editor window is open on a different preset, close it
+        // to avoid showing cues that don't belong to the current selection.
+        // Re-opening Cues from the toolbar will bind it to the new selection.
+        closeCueEditorWindow();
+        updateButtonStates();
+    }
+
+    /// SAVE / DELETE are only meaningful when a preset is selected -- without
+    /// a selection there's nothing to update or delete.  Disabling them in
+    /// that state makes the difference between ADD ("create new from form")
+    /// and SAVE ("update the selected one") obvious without having to read
+    /// any documentation.
+    void updateButtonStates()
+    {
+        const bool hasSelection = table.getSelectedRow() >= 0
+                                  && table.getSelectedRow() < (int)rows.size();
+        btnSave.setEnabled(hasSelection);
+        btnDelete.setEnabled(hasSelection);
+        btnCues.setEnabled(hasSelection);
+    }
+
+    /// When an audio file is set, the audio's actual length is what the
+    /// runtime uses -- the preset's Stop TC stored value is ignored.  Make
+    /// that visually obvious in the form by disabling the field and
+    /// dimming its text, and surface a tooltip explaining why.
+    void updateStopTCEnabledState()
+    {
+        const bool hasAudio = edAudio.getText().trim().isNotEmpty();
+        edStopTC.setEnabled(! hasAudio);
+        edStopTC.setReadOnly(hasAudio);
+        // setColour() only changes the colour for *new* text; the characters
+        // already in the editor keep whatever colour they were drawn with.
+        // applyColourToAllText repaints existing characters too, so when the
+        // audio is cleared the previously-dimmed Stop TC text returns to the
+        // bright colour immediately instead of staying greyed-out until the
+        // user retypes it.
+        const auto col = hasAudio ? textMid : textBright;
+        edStopTC.setColour(juce::TextEditor::textColourId, col);
+        edStopTC.applyColourToAllText(col, true);
+        edStopTC.setTooltip(hasAudio
+            ? "Stop TC is determined by the loaded audio file's length when one is set. "
+              "Clear the audio field to edit Stop TC manually."
+            : juce::String());
     }
 
     void cellDoubleClicked(int rowNumber, int, const juce::MouseEvent&) override
@@ -204,6 +313,7 @@ public:
         btnAdd     .setBounds(btnRow.removeFromLeft(btnW)); btnRow.removeFromLeft(gap);
         btnSave    .setBounds(btnRow.removeFromLeft(btnW)); btnRow.removeFromLeft(gap);
         btnDelete  .setBounds(btnRow.removeFromLeft(btnW)); btnRow.removeFromLeft(gap);
+        btnCues    .setBounds(btnRow.removeFromLeft(btnW)); btnRow.removeFromLeft(gap);
         btnClearAll.setBounds(btnRow.removeFromLeft(btnW));
         formArea.removeFromBottom(6);
 
@@ -254,7 +364,7 @@ private:
     std::vector<GeneratorPreset> rows;
 
     // Buttons
-    juce::TextButton btnAdd, btnSave, btnDelete, btnClearAll;
+    juce::TextButton btnAdd, btnSave, btnDelete, btnCues, btnClearAll;
     juce::TextButton btnImport, btnExport, btnOscHelp;
     juce::TextButton btnBrowseAudio, btnClearAudio;
     juce::ToggleButton btnLoopAudio;
@@ -265,6 +375,19 @@ private:
 
     // File chooser (must persist during async operation)
     std::unique_ptr<juce::FileChooser> fileChooser;
+
+    // Cue editor window (lazy-created on first Cues click; reused after)
+    std::unique_ptr<GeneratorCuePointEditorWindow> cueWindow;
+    // Frame rate in fps used by the cue editor when projecting cue TC
+    // onto the audio waveform strip.  Pushed by MainComponent (the only
+    // thing that knows the engine's current fps) before opening the
+    // window via setCurrentFpsForCueEditor.  Default 30 if never set.
+    double currentFpsForCueEditor = 30.0;
+
+    // Playhead getter forwarded to the cue editor when opened.  Set by
+    // MainComponent so the waveform strip can show a live red cursor
+    // whenever the engine is playing the preset that's being edited.
+    std::function<int64_t()> playheadGetter;
 
     // Colors
     juce::Colour bgDarker   { 0xFF1A1A1A };
@@ -285,6 +408,7 @@ private:
         rebuildRows();
         table.updateContent();
         table.repaint();
+        updateButtonStates();
         if (onChange) onChange();
     }
 
@@ -312,15 +436,11 @@ private:
              + juce::String(f).paddedLeft('0', 2);
     }
 
-    void addNewPreset()
+    /// Build a GeneratorPreset from the current form fields.
+    /// Normalises Start TC / Stop TC and writes the normalised values back
+    /// to the editors so what the user sees matches what gets saved.
+    GeneratorPreset readFormToPreset(const juce::String& name)
     {
-        auto name = edName.getText().trim();
-        if (name.isEmpty())
-        {
-            edName.grabKeyboardFocus();
-            return;
-        }
-
         GeneratorPreset p;
         p.name    = name;
         p.startTC = edStartTC.getText().trim();
@@ -333,11 +453,134 @@ private:
         p.stopTC  = normalizeTC(p.stopTC);
         edStartTC.setText(p.startTC, false);
         edStopTC.setText(p.stopTC, false);
+        return p;
+    }
 
+    /// Return `name` unchanged if no preset exists with that name; otherwise
+    /// append " (2)", " (3)", ... until a free name is found.  Comparison
+    /// is case-insensitive to match the underlying map's key handling.
+    /// In the absurd edge case where 999 numbered duplicates already exist,
+    /// fall back to a timestamp suffix rather than returning a name that
+    /// would silently overwrite an existing preset.
+    juce::String makeUniqueName(const juce::String& name) const
+    {
+        if (presetMap.find(name) == nullptr)
+            return name;
+        for (int i = 2; i < 1000; ++i)
+        {
+            auto candidate = name + " (" + juce::String(i) + ")";
+            if (presetMap.find(candidate) == nullptr)
+                return candidate;
+        }
+        // Pathological -- thousands of duplicates already exist.  Use a
+        // timestamp so we still return a unique name; if even *that* exists
+        // we just return it anyway, which is the best we can do without
+        // throwing.
+        return name + " (" + juce::String(juce::Time::currentTimeMillis()) + ")";
+    }
+
+    /// ADD always creates a new preset.  If the typed name is already in
+    /// use, the new preset is auto-renamed "Name (2)", "Name (3)", etc.
+    /// The form is repopulated so the user sees the actual name used.
+    void addNewPreset()
+    {
+        auto name = edName.getText().trim();
+        if (name.isEmpty())
+        {
+            edName.grabKeyboardFocus();
+            return;
+        }
+
+        auto uniqueName = makeUniqueName(name);
+        auto p = readFormToPreset(uniqueName);
+        // Reflect the actual stored name in the field whenever it differs
+        // from what was typed -- either because we auto-numbered to avoid
+        // a collision, or because the input had surrounding whitespace
+        // that got trimmed.
+        if (uniqueName != edName.getText())
+            edName.setText(uniqueName, juce::dontSendNotification);
+
+        // Close any open cue window: addOrUpdate on an unordered_map can
+        // trigger a rehash that invalidates pointers to existing values,
+        // which is what the cue window is holding internally.
+        closeCueEditorWindow();
         presetMap.addOrUpdate(p);
         notifyChange();
 
-        // Select the newly added row
+        // Select the newly added row so SAVE / DELETE target it.
+        for (int i = 0; i < (int)rows.size(); ++i)
+        {
+            if (rows[(size_t)i].name.equalsIgnoreCase(uniqueName))
+            {
+                table.selectRow(i);
+                break;
+            }
+        }
+    }
+
+    /// SAVE updates the currently-selected preset in place.  The name field
+    /// can be edited to rename the preset, but only if the new name is not
+    /// already used by a *different* preset -- in that case we refuse and
+    /// tell the user, so SAVE never silently overwrites someone else's
+    /// preset.  When no row is selected, SAVE is a no-op (the button is
+    /// disabled in that state, but we double-check defensively).
+    void saveSelectedPreset()
+    {
+        auto name = edName.getText().trim();
+        if (name.isEmpty())
+        {
+            edName.grabKeyboardFocus();
+            return;
+        }
+
+        int sel = table.getSelectedRow();
+        if (sel < 0 || sel >= (int)rows.size())
+            return;  // nothing selected; UI should already prevent this
+
+        // Snapshot the existing name *by value* before any mutation -- the
+        // rows[] vector is rebuilt by notifyChange(), so a reference into
+        // it would dangle the moment we touch the map.
+        const juce::String oldName     = rows[(size_t)sel].name;
+        const bool         nameChanged = ! oldName.equalsIgnoreCase(name);
+
+        // If the user typed a name that belongs to a *different* preset,
+        // refuse the rename rather than silently clobber it.  We're already
+        // inside the nameChanged branch, where the canonical keys (lower-
+        // cased + trimmed) of old and new differ -- so any non-null find()
+        // is necessarily a different preset.  A case-only rename
+        // ("Foo" -> "FOO") sets nameChanged to false via equalsIgnoreCase
+        // and skips this branch entirely, hitting addOrUpdate with the same
+        // key and updating the entry's display name in place.
+        if (nameChanged && presetMap.find(name) != nullptr)
+        {
+            juce::AlertWindow::showMessageBoxAsync(
+                juce::MessageBoxIconType::WarningIcon,
+                "Name in use",
+                "A preset called \"" + name + "\" already exists. "
+                "Choose a different name, or select that preset and Save to overwrite it.",
+                "OK");
+            edName.grabKeyboardFocus();
+            return;
+        }
+
+        if (nameChanged)
+            presetMap.remove(oldName);
+
+        auto p = readFormToPreset(name);
+        // Mirror the trimmed name back if the user's input had surrounding
+        // whitespace (matches what addNewPreset does).
+        if (name != edName.getText())
+            edName.setText(name, juce::dontSendNotification);
+        // Close any cue window for safety: even if the user is editing the
+        // same preset, the rename / overwrite flow goes through remove +
+        // addOrUpdate which can rehash and invalidate the cue window's
+        // pointer.  Re-opening Cues from the table picks up the new entry.
+        closeCueEditorWindow();
+        presetMap.addOrUpdate(p);
+        notifyChange();
+
+        // Re-select the (possibly renamed) preset so subsequent SAVE keeps
+        // working without needing to click the row again.
         for (int i = 0; i < (int)rows.size(); ++i)
         {
             if (rows[(size_t)i].name.equalsIgnoreCase(name))
@@ -348,42 +591,14 @@ private:
         }
     }
 
-    void saveSelectedPreset()
-    {
-        auto name = edName.getText().trim();
-        if (name.isEmpty()) return;
-
-        // If a row is selected and the name matches, update it
-        int sel = table.getSelectedRow();
-        if (sel >= 0 && sel < (int)rows.size())
-        {
-            auto& existing = rows[(size_t)sel];
-            // Remove old entry if name changed
-            if (!existing.name.equalsIgnoreCase(name))
-                presetMap.remove(existing.name);
-        }
-
-        GeneratorPreset p;
-        p.name    = name;
-        p.startTC = edStartTC.getText().trim();
-        p.stopTC  = edStopTC.getText().trim();
-        p.audioFilePath = edAudio.getText().trim();
-        p.audioLoop     = btnLoopAudio.getToggleState();
-        if (p.startTC.isEmpty()) p.startTC = "00:00:00:00";
-        if (p.stopTC.isEmpty())  p.stopTC  = "00:00:00:00";
-        p.startTC = normalizeTC(p.startTC);
-        p.stopTC  = normalizeTC(p.stopTC);
-        edStartTC.setText(p.startTC, false);
-        edStopTC.setText(p.stopTC, false);
-
-        presetMap.addOrUpdate(p);
-        notifyChange();
-    }
-
     void deleteSelected()
     {
         int sel = table.getSelectedRow();
         if (sel < 0 || sel >= (int)rows.size()) return;
+
+        // Close cue editor: it may be holding a reference into the very
+        // entry we're about to remove from the map.
+        closeCueEditorWindow();
 
         presetMap.remove(rows[(size_t)sel].name);
         notifyChange();
@@ -394,6 +609,67 @@ private:
         edStopTC.setText("00:00:00:00", false);
         edAudio.clear();
         btnLoopAudio.setToggleState(false, juce::dontSendNotification);
+        updateButtonStates();
+    }
+
+    /// Close any open cue editor window.  Called before any operation
+    /// that mutates the preset map (delete, rename, clearAll, import) to
+    /// avoid leaving the cue window with a dangling reference into a
+    /// preset entry that may be moved or destroyed by std::map ops.
+    void closeCueEditorWindow()
+    {
+        if (cueWindow != nullptr)
+        {
+            cueWindow->setVisible(false);
+            cueWindow.reset();
+        }
+    }
+
+    /// Open the cue-point editor for the selected preset.
+    /// The window is constructed against a *pointer* into the live
+    /// GeneratorPresetMap (not against rows[], which is a sorted snapshot
+    /// that gets rebuilt on every notifyChange).  That way edits made in
+    /// the cue window are persisted on the actual preset object.
+    void openCueEditor()
+    {
+        int sel = table.getSelectedRow();
+        if (sel < 0 || sel >= (int)rows.size()) return;
+
+        const auto presetName = rows[(size_t)sel].name;
+        auto* livePreset = presetMap.find(presetName);
+        if (livePreset == nullptr) return;  // shouldn't happen, defensive
+
+        // Close any previous window first (it may be holding a reference
+        // into a different preset, or even a stale one if the user just
+        // renamed something).
+        closeCueEditorWindow();
+
+        cueWindow = std::make_unique<GeneratorCuePointEditorWindow>(
+            *livePreset, currentFpsForCueEditor);
+        if (auto* ed = cueWindow->getEditor())
+        {
+            ed->onChange = [this]
+            {
+                // Persist + refresh the preset table.  rebuildRows only
+                // *reads* the map (copies entries into the rows snapshot),
+                // it doesn't mutate the underlying unordered_map, so the
+                // cue window's pointer into the map remains valid.
+                presetMap.save();
+                rebuildRows();
+                table.updateContent();
+                table.repaint();
+                if (onChange) onChange();
+            };
+            // If the host installed a playhead getter (MainComponent did,
+            // bound to its engine), forward the same getter to the cue
+            // editor so it can drive the live playback cursor in the
+            // waveform strip.  When no getter is set the cue editor just
+            // doesn't show a playhead -- everything else still works.
+            if (playheadGetter)
+                ed->setPlayheadGetter(playheadGetter);
+        }
+        cueWindow->setVisible(true);
+        cueWindow->toFront(true);
     }
 
     void clearAll()
@@ -412,6 +688,7 @@ private:
             {
                 if (result == 1)
                 {
+                    closeCueEditorWindow();
                     presetMap.clear();
                     notifyChange();
                     edName.clear();
@@ -462,6 +739,7 @@ private:
                 auto file = fc.getResult();
                 if (file == juce::File() || ! file.existsAsFile()) return;
                 edAudio.setText(file.getFullPathName(), false);
+                updateStopTCEnabledState();
             });
     }
 
@@ -469,6 +747,7 @@ private:
     {
         edAudio.clear();
         btnLoopAudio.setToggleState(false, juce::dontSendNotification);
+        updateStopTCEnabledState();
     }
 
     void exportPresets()
@@ -525,6 +804,11 @@ private:
 
                 auto* arr = obj->getProperty("presets").getArray();
                 if (!arr) return;
+
+                // Close any cue window: the bulk addOrUpdate calls below
+                // can rehash the underlying unordered_map and invalidate
+                // pointers held by the cue window.
+                closeCueEditorWindow();
 
                 int imported = 0;
                 for (auto& item : *arr)

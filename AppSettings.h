@@ -111,6 +111,115 @@ struct CuePoint
 };
 
 //==============================================================================
+// GeneratorCuePoint -- a cue inside a Generator preset.  Same trigger
+// payload as CuePoint (MIDI/OSC/Art-Net) but the trigger position is
+// expressed as an absolute SMPTE timecode (HH:MM:SS:FF) rather than as
+// milliseconds from track start.  This matches the rest of the Generator
+// preset editor (which already speaks in TC for Start / Stop) and means a
+// cue at "01:00:30:00" works identically whether the preset has an audio
+// file (TC follows the audio playhead) or runs in pure TC-generation mode.
+//==============================================================================
+struct GeneratorCuePoint
+{
+    juce::String positionTC = "00:00:00:00";  // HH:MM:SS:FF -- when to fire
+    juce::String name;                          // user label
+
+    // Trigger config -- mirrors CuePoint exactly so the same dispatch
+    // helpers (firing MIDI / OSC / DMX) can be reused.
+    int  midiChannel  = 0;          // 0-15 (displayed as 1-16)
+    int  midiNoteNum  = -1;         // -1 = disabled
+    int  midiNoteVel  = 127;
+    int  midiCCNum    = -1;         // -1 = disabled
+    int  midiCCVal    = 127;
+
+    juce::String oscAddress;
+    juce::String oscArgs;
+
+    int  artnetCh     = 0;          // 0 = disabled, 1-512
+    int  artnetVal    = 255;
+
+    bool hasMidiTrigger()   const { return midiNoteNum >= 0 || midiCCNum >= 0; }
+    bool hasOscTrigger()    const { return oscAddress.isNotEmpty(); }
+    bool hasArtnetTrigger() const { return artnetCh > 0; }
+    bool hasAnyTrigger()    const { return hasMidiTrigger() || hasOscTrigger() || hasArtnetTrigger(); }
+
+    /// Convert positionTC to total milliseconds (frame -> ms uses the
+    /// supplied frame rate; default 30 matches the rest of the codebase
+    /// when the caller doesn't know the engine's effective fps).  This is
+    /// the form the engine uses to compare against its current TC and
+    /// decide whether a cue should fire.
+    uint32_t positionMs(double fps = 30.0) const
+    {
+        auto parts = juce::StringArray::fromTokens(positionTC, ":.", "");
+        int h = 0, m = 0, s = 0, f = 0;
+        if (parts.size() >= 1) h = parts[0].getIntValue();
+        if (parts.size() >= 2) m = parts[1].getIntValue();
+        if (parts.size() >= 3) s = parts[2].getIntValue();
+        if (parts.size() >= 4) f = parts[3].getIntValue();
+        if (fps <= 0.0) fps = 30.0;
+        double totalSec = h * 3600.0 + m * 60.0 + s + (double) f / fps;
+        return (uint32_t) juce::jmax(0.0, totalSec * 1000.0);
+    }
+
+    juce::var toVar() const
+    {
+        auto* obj = new juce::DynamicObject();
+        obj->setProperty("positionTC", positionTC);
+        if (name.isNotEmpty())
+            obj->setProperty("name", name);
+
+        if (midiNoteNum >= 0 || midiCCNum >= 0)
+        {
+            obj->setProperty("midiChannel", midiChannel);
+            obj->setProperty("midiNoteNum", midiNoteNum);
+            obj->setProperty("midiNoteVel", midiNoteVel);
+            obj->setProperty("midiCCNum",   midiCCNum);
+            obj->setProperty("midiCCVal",   midiCCVal);
+        }
+        if (oscAddress.isNotEmpty())
+        {
+            obj->setProperty("oscAddress", oscAddress);
+            if (oscArgs.isNotEmpty())
+                obj->setProperty("oscArgs", oscArgs);
+        }
+        if (artnetCh > 0)
+        {
+            obj->setProperty("artnetCh",  artnetCh);
+            obj->setProperty("artnetVal", artnetVal);
+        }
+        return juce::var(obj);
+    }
+
+    void fromVar(const juce::var& v)
+    {
+        auto* obj = v.getDynamicObject();
+        if (!obj) return;
+
+        auto getInt = [&](const char* key, int def) {
+            auto val = obj->getProperty(key);
+            return val.isVoid() ? def : (int)val;
+        };
+        auto getString = [&](const char* key, const juce::String& def = {}) {
+            auto val = obj->getProperty(key);
+            return val.isVoid() ? def : val.toString();
+        };
+
+        positionTC  = getString("positionTC", "00:00:00:00");
+        if (positionTC.isEmpty()) positionTC = "00:00:00:00";
+        name        = getString("name");
+        midiChannel = juce::jlimit(0, 15, getInt("midiChannel", 0));
+        midiNoteNum = juce::jlimit(-1, 127, getInt("midiNoteNum", -1));
+        midiNoteVel = juce::jlimit(0, 127, getInt("midiNoteVel", 127));
+        midiCCNum   = juce::jlimit(-1, 127, getInt("midiCCNum", -1));
+        midiCCVal   = juce::jlimit(0, 127, getInt("midiCCVal", 127));
+        oscAddress  = getString("oscAddress");
+        oscArgs     = getString("oscArgs");
+        artnetCh    = juce::jlimit(0, 512, getInt("artnetCh", 0));
+        artnetVal   = juce::jlimit(0, 255, getInt("artnetVal", 255));
+    }
+};
+
+//==============================================================================
 // TrackMapEntry -- per-track config: offset, triggers, cue points
 //==============================================================================
 struct TrackMapEntry
@@ -836,8 +945,25 @@ struct GeneratorPreset
     juce::String audioFilePath;                 // empty = no audio playback
     bool         audioLoop = false;             // loop file when reaching its end
 
+    // Cue points -- triggers that fire when the generated TC reaches each
+    // cue's positionTC.  Sorted by positionTC (compared as ms) so the
+    // engine can do a forward linear scan during playback.
+    std::vector<GeneratorCuePoint> cuePoints;
+
     std::string key() const { return name.toLowerCase().trim().toStdString(); }
     bool hasValidKey() const { return name.trim().isNotEmpty(); }
+
+    bool hasCuePoints() const { return ! cuePoints.empty(); }
+
+    /// Sort cue points by position (ms), with frame-rate cancellation: any
+    /// reasonable fps gives the same ordering since positionTC ordering is
+    /// dominated by H/M/S, frames only matter in tie-breaking.
+    void sortCuePoints()
+    {
+        std::sort(cuePoints.begin(), cuePoints.end(),
+                  [](const GeneratorCuePoint& a, const GeneratorCuePoint& b)
+                  { return a.positionMs() < b.positionMs(); });
+    }
 
     juce::var toVar() const
     {
@@ -847,6 +973,14 @@ struct GeneratorPreset
         obj->setProperty("stopTC",        stopTC);
         obj->setProperty("audioFilePath", audioFilePath);
         obj->setProperty("audioLoop",     audioLoop);
+
+        if (! cuePoints.empty())
+        {
+            juce::Array<juce::var> arr;
+            for (auto& cp : cuePoints)
+                arr.add(cp.toVar());
+            obj->setProperty("cuePoints", arr);
+        }
         return juce::var(obj);
     }
 
@@ -861,6 +995,19 @@ struct GeneratorPreset
         audioLoop     = (bool) obj->getProperty("audioLoop");
         if (startTC.isEmpty()) startTC = "00:00:00:00";
         if (stopTC.isEmpty())  stopTC  = "00:00:00:00";
+
+        cuePoints.clear();
+        auto cuesVar = obj->getProperty("cuePoints");
+        if (auto* arr = cuesVar.getArray())
+        {
+            cuePoints.reserve((size_t) arr->size());
+            for (auto& item : *arr)
+            {
+                GeneratorCuePoint cp;
+                cp.fromVar(item);
+                cuePoints.push_back(std::move(cp));
+            }
+        }
     }
 };
 
@@ -1207,7 +1354,8 @@ struct EngineSettings
         generatorAudioSampleRate = getDouble("generatorAudioSampleRate", 0.0);
         generatorAudioBufferSize = getInt("generatorAudioBufferSize", 0);
         generatorAudioFileChannelMode = getInt("generatorAudioFileChannelMode", 0);
-        proDJLinkPlayer      = juce::jlimit(1, 8, getInt("proDJLinkPlayer", 1));
+        // proDJLinkPlayer ids: 1-6 = players, 7 = XF-A, 8 = XF-B, 9 = MASTER
+        proDJLinkPlayer      = juce::jlimit(1, 9, getInt("proDJLinkPlayer", 1));
         trackMapEnabled      = getBool("trackMapEnabled", getBool("tcnetTrackMapEnabled", false));
         midiClockEnabled     = getBool("midiClockEnabled", getBool("tcnetMidiClock", false));
         oscBpmAddr           = getString("oscBpmAddr", getString("tcnetOscBpmAddr", "/composition/tempocontroller/tempo"));
