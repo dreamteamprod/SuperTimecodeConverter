@@ -390,7 +390,7 @@ The sections below are for developers who want to build STC from source.
 3. **Create a `CMakeLists.txt`** in the project root:
    ```cmake
    cmake_minimum_required(VERSION 3.22)
-   project(SuperTimecodeConverter VERSION 1.9.8)
+   project(SuperTimecodeConverter VERSION 1.9.9)
 
    set(CMAKE_CXX_STANDARD 17)
    set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -400,7 +400,7 @@ The sections below are for developers who want to build STC from source.
    juce_add_gui_app(SuperTimecodeConverter
        PRODUCT_NAME "Super Timecode Converter"
        COMPANY_NAME "Fiverecords"
-       VERSION "1.9.8"
+       VERSION "1.9.9"
        HARDENED_RUNTIME_ENABLED TRUE
        HARDENED_RUNTIME_OPTIONS com.apple.security.device.audio-input
        MICROPHONE_PERMISSION_ENABLED TRUE
@@ -571,6 +571,19 @@ This affects any software using these ports, including the official PRO DJ LINK 
 ### macOS: DJM Subscribe Race Condition
 
 On macOS, the DJM-900NXS2 / DJM-A9 / DJM-V10 may occasionally fail to deliver mixer fader data on the first connection after the DJM is powered on. This is a timing issue in the subscribe handshake. Workaround: restart STC or toggle the Pro DJ Link interface off and on. A delayed-subscribe fix is planned for a future release.
+
+### StageLinQ: Playhead Does Not Advance
+
+The StageLinQ playhead is driven by the device's BeatInfo stream. If STC connects to a Denon player but the playhead stays at zero (BPM and track name may still appear, but position never moves), the BeatInfo stream is not arriving from the device. This has nothing to do with the StateMap subscription -- those two channels are independent on the player side.
+
+Field-reported conditions that silence BeatInfo on SC5000 / SC6000:
+
+- **Deck has no track loaded, or is paused / not playing.** BeatInfo only streams while a track is actively playing.
+- **The physical LINK button on the player is on.** Linking decks via the player itself disables BeatInfo. Turn LINK off on every player on the network.
+- **Decks are linked from Engine DJ.** Same effect as the physical LINK button. Unlink the decks from Engine DJ, or close Engine DJ entirely if it is not needed.
+- **Player was already running when STC started.** Some firmware revisions only emit BeatInfo if a consumer was already listening at the time the player booted. Power-cycling the player after STC is running is enough.
+
+Walk through the four conditions in that order before assuming a network or firmware issue. If the playhead still does not move after all four are satisfied, a Wireshark capture of STC connecting to the player would help diagnose; please open an issue and attach the `.pcapng`.
 
 ### rekordbox Cannot Run Simultaneously with STC
 

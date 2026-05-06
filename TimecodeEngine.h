@@ -137,6 +137,10 @@ public:
         userOverrodeLtcFps = false;
         activeInput = source;
         sourceActive = false;
+        // Switching the input source is an explicit user transition; any
+        // pending natural-EOF marker from the Generator path is no longer
+        // relevant and must not survive the round-trip.
+        genEndedAtEof = false;
 
         // Releasing the Generator audio output device when the engine
         // switches to a non-Generator input is important for shows where
@@ -1857,6 +1861,10 @@ public:
     {
         if (genState == GeneratorState::Playing) return;
 
+        // Explicit user transition; any pending natural-EOF marker is no
+        // longer relevant to the next click on the timeline.
+        genEndedAtEof = false;
+
         const bool wasStopped = (genState == GeneratorState::Stopped);
         if (wasStopped)
         {
@@ -1898,6 +1906,9 @@ public:
     void generatorStop()
     {
         genState = GeneratorState::Stopped;
+        // Explicit user transition; clear the natural-EOF marker so a
+        // subsequent click on the timeline does NOT auto-resume.
+        genEndedAtEof = false;
         genCurrentMs = genStartMs;
         // Reset the crossing-based cue cursor too -- the next play will
         // start from genStartMs and we want the first tick's (prev, now]
@@ -1984,6 +1995,10 @@ public:
     ///   Stopped -> Paused  (preserves the seeked position; if we stayed in
     ///                       Stopped, the next generatorPlay() would reset
     ///                       genCurrentMs to genStartMs and discard the seek)
+    ///   Stopped + genEndedAtEof -> Playing (the player just finished a
+    ///                       track naturally; clicking the timeline is
+    ///                       interpreted as "play from here", consistent
+    ///                       with consumer media players)
     ///
     /// The caller is responsible for any clamping (e.g. against Stop TC or
     /// the audio file's length); this method only enforces newMs >= 0.
@@ -2000,14 +2015,36 @@ public:
         // on the lower bound.
         lastCueCheckMs = (uint32_t) juce::jmax(0.0, genCurrentMs);
 
+        // Decide the post-seek state.  Stopped + genEndedAtEof means we
+        // just finished the track on its own; treat the click as a
+        // "resume from here" instead of a cue.  Any other Stopped becomes
+        // Paused (preserves previous behaviour for cold scrub / post-Stop
+        // scrub).  Playing / Paused are not modified.
+        const bool resumeFromEof = (genState == GeneratorState::Stopped
+                                    && genEndedAtEof);
         if (genState == GeneratorState::Stopped)
-            genState = GeneratorState::Paused;
+            genState = resumeFromEof ? GeneratorState::Playing
+                                      : GeneratorState::Paused;
+
+        // Consume the flag once acted on so the same click never
+        // resumes twice.  Cleared regardless of whether we used it
+        // (a click while Playing/Paused also implies the user has
+        // moved on from the natural-end state).
+        genEndedAtEof = false;
 
         if (activeInput == InputSource::SystemTime)
             currentTimecode = wallClockToTimecode(genCurrentMs, currentFps);
 
         const double audioPosSec = juce::jmax(0.0, (genCurrentMs - genStartMs) / 1000.0);
         generatorAudioPlayer.seekSeconds(audioPosSec);
+
+        // For the EOF-resume case, the audio player still has shouldPlay
+        // cleared (stopAndReset was called when the EOF auto-stop fired),
+        // so seekSeconds alone will not have restarted the transport.
+        // Arm the play intent now; play() also calls transport.start()
+        // at the just-seeked position.
+        if (resumeFromEof)
+            generatorAudioPlayer.play();
     }
 
     double getGeneratorStartMs() const { return genStartMs; }
@@ -2057,10 +2094,18 @@ public:
     void setGeneratorAudioFile(const juce::File& file, bool shouldLoop)
     {
         const juce::File f = (file == juce::File() || ! file.existsAsFile()) ? juce::File() : file;
+        // New file (or unload) invalidates the natural-EOF marker -- a
+        // click on the timeline of a freshly loaded track should cue,
+        // not auto-resume from the previous track's EOF intent.
+        genEndedAtEof = false;
         generatorAudioPlayer.requestLoad(f, shouldLoop);
     }
 
-    void clearGeneratorAudioFile() { generatorAudioPlayer.requestLoad(juce::File(), false); }
+    void clearGeneratorAudioFile()
+    {
+        genEndedAtEof = false;
+        generatorAudioPlayer.requestLoad(juce::File(), false);
+    }
 
     bool       hasGeneratorAudioFile()    const { return generatorAudioPlayer.hasFileLoaded(); }
     juce::File getGeneratorAudioFile()    const { return generatorAudioPlayer.getCurrentFile(); }
@@ -2203,6 +2248,14 @@ private:
     double genStopMs    = 0.0;     // stop TC in ms (0 = freerun)
     double genCurrentMs = 0.0;     // current position in ms
     double genLastTickTime = 0.0;  // hiRes ms for delta calculation
+    // Set when the generator stops automatically because the loaded audio
+    // file reached EOF (as opposed to a user-initiated stop).  Consumed by
+    // setGeneratorPosition() so that a click on the timeline immediately
+    // after the track ends both seeks and resumes audio in one action,
+    // matching the muscle memory of consumer media players.  Cleared by
+    // any explicit user transition (Play / Stop / file change / input
+    // source change), so it never survives a context switch.
+    bool   genEndedAtEof = false;
 
     // Generator audio playback (per-engine, optional)
     GeneratorAudioPlayer generatorAudioPlayer;
@@ -3261,6 +3314,33 @@ private:
                 genCurrentMs = genStopMs;
                 genState = GeneratorState::Stopped;
                 generatorAudioPlayer.stopAndReset();
+            }
+            // Auto-stop when the loaded audio file has played to its end.
+            // Without this, the SMPTE would keep advancing past the file's
+            // last sample (the audio transport silently auto-stops at EOF
+            // but nothing was relaying that back to the generator state).
+            // Looping files fold around inside seekSeconds() so they do
+            // not reach this branch; a user-defined stop TC takes
+            // precedence (handled by the prior branch).
+            //
+            // genEndedAtEof is set so that a subsequent click on the
+            // waveform timeline (setGeneratorPosition) treats the seek
+            // as a "resume from new position" gesture instead of just
+            // cueing.  See setGeneratorPosition for the consumer side.
+            else
+            {
+                const double fileLenSec = generatorAudioPlayer.getFileLengthSeconds();
+                if (fileLenSec > 0.0 && ! generatorAudioPlayer.isLooping())
+                {
+                    const double endMs = genStartMs + fileLenSec * 1000.0;
+                    if (genCurrentMs >= endMs)
+                    {
+                        genCurrentMs = endMs;
+                        genState = GeneratorState::Stopped;
+                        genEndedAtEof = true;
+                        generatorAudioPlayer.stopAndReset();
+                    }
+                }
             }
 
             // Check armed cue points against the current generated TC.

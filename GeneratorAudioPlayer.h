@@ -351,6 +351,11 @@ public:
 
     /// Seek to position in seconds, relative to the start of the audio file.
     /// When looping, positions beyond file length are folded back via fmod.
+    /// If the player was supposed to be playing (shouldPlay set, not paused)
+    /// but the transport had auto-stopped (typically because it reached EOF
+    /// before this seek), the transport is re-engaged so audio resumes from
+    /// the new position.  start() is a no-op when the transport is already
+    /// playing, so the in-flight seek-while-playing case is unaffected.
     void seekSeconds(double seconds)
     {
         if (! hasFileLoaded()) return;
@@ -368,6 +373,13 @@ public:
         }
 
         transport.setPosition(seconds);
+
+        if (shouldPlay.load(std::memory_order_acquire)
+            && ! userPaused.load(std::memory_order_acquire)
+            && deviceOpen.load(std::memory_order_relaxed))
+        {
+            transport.start();
+        }
     }
 
     double getCurrentPositionSeconds() const { return transport.getCurrentPosition(); }

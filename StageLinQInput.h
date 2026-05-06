@@ -54,7 +54,13 @@ namespace StageLinQ
     // StateMap sub-types (bytes 8-11 inside smaa block)
     static constexpr uint32_t kSmaaStateEmit       = 0x00000000;  // device -> us: state value
     static constexpr uint32_t kSmaaEmitResponse     = 0x000007D1;  // device -> us: subscription ack
-    static constexpr uint32_t kSmaaSubscribe        = 0x000007D2;  // us -> device: subscribe request
+    // 0x07D2 is used in both directions:
+    //  - us -> device: subscribe request, with min interval (ms) appended after the path
+    //  - device -> us: periodic catalogue announcement of the paths the device offers
+    //    (no JSON value, just path + 4-byte interval).  Some firmware revisions
+    //    re-broadcast their catalogue on this opcode every few seconds; we
+    //    silently consume them since we already know what we asked for.
+    static constexpr uint32_t kSmaaSubscribe        = 0x000007D2;  // bidirectional, see above
 
     // TCP message IDs (first 4 bytes of TCP messages)
     static constexpr uint32_t kMsgServiceAnnounce   = 0x00000000;
@@ -439,6 +445,25 @@ namespace StageLinQ
     //==========================================================================
     // Build a BeatInfo start-stream frame
     //==========================================================================
+    //
+    // Handshake is exactly 8 bytes: length=4 (BE), magic=0x00000000 (BE).
+    // Adding any payload (e.g. our token) is a known way to make the device
+    // silently refuse to stream -- the connection stays open but no packets
+    // ever arrive.  Independent third-party Python implementations against
+    // SC5000 have reproduced this; keep the frame minimal.
+    //
+    // BeatInfo silence conditions (field-reported, not all firmware-confirmed):
+    //   - The deck has no track loaded, or is not in playback.
+    //   - Some firmware will only emit if the consumer was already listening
+    //     when the device booted; power-cycling the device after STC has
+    //     started restores the stream.
+    //   - The physical LINK button on the SC5000 is on.  Linking decks at
+    //     the device disables BeatInfo on the device side.
+    //   - Decks are linked from Engine DJ (same effect as the physical LINK
+    //     button).
+    //
+    // If a user reports "StageLinQ playhead never moves", these are the four
+    // things to walk through before assuming a bug in this code path.
     inline std::vector<uint8_t> buildBeatInfoStart()
     {
         std::vector<uint8_t> frame;
@@ -2552,9 +2577,12 @@ private:
                             }
                         }
                     }
-                    // kSmaaEmitResponse (0x7D1) -- subscription ack, ignore
+                    // kSmaaEmitResponse (0x7D1) -- subscription ack, ignore.
+                    // kSmaaSubscribe (0x7D2) from device direction -- periodic
+                    // catalogue announce (path + interval, no JSON), ignore.
 #if JUCE_DEBUG
-                    else if (subType != StageLinQ::kSmaaEmitResponse)
+                    else if (subType != StageLinQ::kSmaaEmitResponse
+                             && subType != StageLinQ::kSmaaSubscribe)
                     {
                         DBG("StageLinQ: Unknown smaa subtype 0x"
                             + juce::String::toHexString((int)subType)
