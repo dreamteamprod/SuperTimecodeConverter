@@ -4087,7 +4087,9 @@ void MainComponent::populateMidiAndNetworkCombos()
         cmbHippoInputInterface.setSelectedId(savedHippoIn, juce::dontSendNotification);
     else if (cmbHippoInputInterface.getNumItems() > 0)
         cmbHippoInputInterface.setSelectedId(1, juce::dontSendNotification);
-    if (savedArtOut > 0 && savedArtOut <= cmbArtnetOutputInterface.getNumItems())
+    if (savedArtOut == 1000)
+        cmbArtnetOutputInterface.setSelectedId(1000, juce::dontSendNotification);
+    else if (savedArtOut > 0 && savedArtOut <= cmbArtnetOutputInterface.getNumItems())
         cmbArtnetOutputInterface.setSelectedId(savedArtOut, juce::dontSendNotification);
     if (savedArtDmx > 0 && savedArtDmx <= cmbArtnetDmxInterface.getNumItems())
         cmbArtnetDmxInterface.setSelectedId(savedArtDmx, juce::dontSendNotification);
