@@ -57,24 +57,29 @@ public:
 
         destPort = targetPort;
 
-        if (interfaceIndex == -2)
+        broadcastTargets.clear();
+
+        if (interfaceIndex >= 0 && interfaceIndex < availableInterfaces.size())
         {
-            // Loopback: send to 127.0.0.1 so receivers on the same machine see it
-            selectedInterface = -2;
-            broadcastIp = "127.0.0.1";
-            bindIp = "127.0.0.1";
-        }
-        else if (interfaceIndex >= 0 && interfaceIndex < availableInterfaces.size())
-        {
+            // Specific interface: send only to that interface's subnet broadcast.
             selectedInterface = interfaceIndex;
             broadcastIp = availableInterfaces[interfaceIndex].broadcast;
             bindIp = availableInterfaces[interfaceIndex].ip;
+            broadcastTargets.add(broadcastIp);
         }
         else
         {
-            selectedInterface = -1;
-            broadcastIp = "255.255.255.255";
+            // "All Interfaces" (-1) and "Localhost" (-2): on Windows, 255.255.255.255
+            // only goes out on the default-route interface and misses adapters like
+            // VMware virtual switches. Send to every known interface's subnet broadcast
+            // so any Art-Net listener (on any adapter) receives the packet.
+            selectedInterface = interfaceIndex;
             bindIp = "0.0.0.0";
+            for (auto& ni : availableInterfaces)
+                broadcastTargets.add(ni.broadcast);
+            // Also send to the limited broadcast in case there are adapters we missed.
+            broadcastTargets.addIfNotAlreadyThere("255.255.255.255");
+            broadcastIp = broadcastTargets.size() > 1 ? "All Interfaces" : "255.255.255.255";
         }
 
         socket = std::make_unique<juce::DatagramSocket>(false);
@@ -88,9 +93,7 @@ public:
             }
         }
 
-        // Enable SO_BROADCAST for broadcast destinations (not needed for loopback).
-        // Some systems (especially Linux) reject broadcast sends without this.
-        if (selectedInterface != -2)
+        // Enable SO_BROADCAST so the OS allows sending to broadcast addresses.
         {
             auto rawSock = socket->getRawSocketHandle();
             if (rawSock >= 0)
@@ -239,9 +242,12 @@ public:
         // DMX data
         std::memcpy(packet + 18, dmxData, (size_t)numChannels);
 
-        int written = socket->write(broadcastIp, destPort, packet, 18 + numChannels);
-        if (written < 0)
-            sendErrors.fetch_add(1, std::memory_order_relaxed);
+        for (auto& target : broadcastTargets)
+        {
+            int written = socket->write(target, destPort, packet, 18 + numChannels);
+            if (written < 0)
+                sendErrors.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
 private:
@@ -353,9 +359,12 @@ private:
 
         packet[18] = (uint8_t)fpsToRateCode(fps);
 
-        int written = socket->write(broadcastIp, destPort, packet, sizeof(packet));
-        if (written < 0)
-            sendErrors.fetch_add(1, std::memory_order_relaxed);
+        for (auto& target : broadcastTargets)
+        {
+            int written = socket->write(target, destPort, packet, sizeof(packet));
+            if (written < 0)
+                sendErrors.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     void updateTimerRate()
@@ -369,6 +378,7 @@ private:
     std::unique_ptr<juce::DatagramSocket> socket;
     juce::String broadcastIp = "255.255.255.255";
     juce::String bindIp = "0.0.0.0";
+    juce::StringArray broadcastTargets;
     int destPort = 6454;
     int selectedInterface = -1;
     std::atomic<bool> isRunningFlag { false };

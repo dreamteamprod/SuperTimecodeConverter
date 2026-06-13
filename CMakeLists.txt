@@ -30,6 +30,7 @@ target_compile_definitions(SuperTimecodeConverter PRIVATE
     JUCE_APPLICATION_NAME_STRING="$<TARGET_PROPERTY:SuperTimecodeConverter,JUCE_PRODUCT_NAME>"
     JUCE_APPLICATION_VERSION_STRING="$<TARGET_PROPERTY:SuperTimecodeConverter,JUCE_VERSION>"
     SQLITE_THREADSAFE=1
+    $<$<PLATFORM_ID:Windows>:NOMINMAX>
 )
 
 target_link_libraries(SuperTimecodeConverter PRIVATE
@@ -44,5 +45,5 @@ target_link_libraries(SuperTimecodeConverter PRIVATE
     juce::juce_gui_extra
     juce::juce_cryptography
     juce::juce_recommended_config_flags
-    curl
+    $<$<NOT:$<PLATFORM_ID:Windows>>:curl>
 )

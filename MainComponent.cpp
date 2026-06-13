@@ -4012,7 +4012,7 @@ void MainComponent::populateMidiAndNetworkCombos()
 
     cmbArtnetInputInterface.addItem("All Interfaces" + getArtnetMarker(1, true), 1);
     cmbArtnetOutputInterface.addItem("All Interfaces (Broadcast)" + getArtnetMarker(1, false), 1);
-    cmbArtnetOutputInterface.addItem("Localhost (127.0.0.1)" + getArtnetMarker(1000, false), 1000);
+    cmbArtnetOutputInterface.addItem("Localhost (All Adapters)" + getArtnetMarker(1000, false), 1000);
     cmbArtnetDmxInterface.addItem("All Interfaces (Broadcast)", 1);
     cmbTcnetInterface.clear(juce::dontSendNotification);
     cmbTcnetInterface.addItem("All Interfaces (Broadcast)", 1);
