@@ -1558,11 +1558,13 @@ MainComponent::MainComponent()
         auto& eng = currentEngine();
         if (eng.isOutputArtnetEnabled())
         {
-            int sel = cmbArtnetOutputInterface.getSelectedId() - 2;
+            int comboSel = cmbArtnetOutputInterface.getSelectedId();
+            int sel = (comboSel == 1000) ? -2 : (comboSel - 2);
             eng.stopArtnetOutput();
             eng.startArtnetOutput(sel);
             // Update combo to actual interface before repopulate (handles fallback)
-            int actualId = eng.getArtnetOutput().getSelectedInterface() + 2;
+            int rawIface = eng.getArtnetOutput().getSelectedInterface();
+            int actualId = (rawIface == -2) ? 1000 : (rawIface + 2);
             cmbArtnetOutputInterface.setSelectedId(actualId, juce::dontSendNotification);
             populateMidiAndNetworkCombos();  // refresh markers (auto-restores all selections)
             saveSettings();
@@ -2286,10 +2288,17 @@ void MainComponent::syncUIFromEngine()
         cmbHippoTcChannel.setSelectedId(es.hippotizerTcChannel + 1, juce::dontSendNotification);
         eng.getHippotizerInput().setSelectedTcIndex(es.hippotizerTcChannel);
 
-        int artOutId = es.artnetOutputInterface + 1;
-        if (artOutId < 1) artOutId = 1;              // handle legacy -1 default
-        if (artOutId <= cmbArtnetOutputInterface.getNumItems())
-            cmbArtnetOutputInterface.setSelectedId(artOutId, juce::dontSendNotification);
+        if (es.artnetOutputInterface == -2)
+        {
+            cmbArtnetOutputInterface.setSelectedId(1000, juce::dontSendNotification);
+        }
+        else
+        {
+            int artOutId = es.artnetOutputInterface + 1;
+            if (artOutId < 1) artOutId = 1;  // handle legacy -1 default
+            if (artOutId <= cmbArtnetOutputInterface.getNumItems())
+                cmbArtnetOutputInterface.setSelectedId(artOutId, juce::dontSendNotification);
+        }
 
         // TCNet interface combo (global setting, not per-engine)
         int tcnetIfId = settings.tcnetInterface + 2;  // -1->1(All), 0->2, 1->3...
@@ -3407,9 +3416,9 @@ void MainComponent::startCurrentMtcOutput()
 void MainComponent::startCurrentArtnetOutput()
 {
     auto& eng = currentEngine();
-    // ArtnetOutput convention: -1 = All Interfaces, 0 = first NIC
-    // Combo IDs: 1 = All, 2 = first NIC -> subtract 2
-    int sel = cmbArtnetOutputInterface.getSelectedId() - 2;
+    // Combo IDs: 1 = All Interfaces (-1), 1000 = Localhost (-2), 2+ = NICs (comboId-2)
+    int comboSel = cmbArtnetOutputInterface.getSelectedId();
+    int sel = (comboSel == 1000) ? -2 : (comboSel - 2);
     eng.startArtnetOutput(sel);
 }
 
@@ -3989,7 +3998,8 @@ void MainComponent::populateMidiAndNetworkCombos()
             }
             if (!isInput && eng.getArtnetOutput().getIsRunning())
             {
-                int inUseComboId = eng.getArtnetOutput().getSelectedInterface() + 2;
+                int rawIface = eng.getArtnetOutput().getSelectedInterface();
+                int inUseComboId = (rawIface == -2) ? 1000 : (rawIface + 2);
                 if (inUseComboId == comboId)
                 {
                     if (isCurrent) currentDot = juce::String(" ") + juce::String::charToString(0x25CF);
@@ -4002,6 +4012,7 @@ void MainComponent::populateMidiAndNetworkCombos()
 
     cmbArtnetInputInterface.addItem("All Interfaces" + getArtnetMarker(1, true), 1);
     cmbArtnetOutputInterface.addItem("All Interfaces (Broadcast)" + getArtnetMarker(1, false), 1);
+    cmbArtnetOutputInterface.addItem("Localhost (127.0.0.1)" + getArtnetMarker(1000, false), 1000);
     cmbArtnetDmxInterface.addItem("All Interfaces (Broadcast)", 1);
     cmbTcnetInterface.clear(juce::dontSendNotification);
     cmbTcnetInterface.addItem("All Interfaces (Broadcast)", 1);
@@ -4313,7 +4324,11 @@ void MainComponent::loadAndApplyNonAudioSettings()
             }
         }
         if (es.artnetOutEnabled)
-            eng.startArtnetOutput(es.artnetOutputInterface - 1);  // saved as combo-1; ArtnetOutput needs -1=All, 0=firstNIC
+        {
+            // artnetOutputInterface: -2=Localhost, 0=All Interfaces (legacy combo-1), 1+=NIC index+1
+            int ifaceIdx = (es.artnetOutputInterface == -2) ? -2 : (es.artnetOutputInterface - 1);
+            eng.startArtnetOutput(ifaceIdx);
+        }
         else if (es.artnetMixerForward && !eng.getArtnetOutput().getIsRunning())
             eng.startArtnetOutput(es.artnetDmxInterface);  // DMX mixer needs the socket even without timecode output
         else if (es.artnetTriggerEnabled && !eng.getArtnetOutput().getIsRunning())
@@ -4542,7 +4557,11 @@ void MainComponent::flushSettings()
             es.generatorClockMode = eng.getGeneratorClockMode();
             es.generatorStartMs = eng.getGeneratorStartMs();
             es.generatorStopMs  = eng.getGeneratorStopMs();
-            es.artnetOutputInterface = cmbArtnetOutputInterface.getSelectedId() - 1;
+            {
+                int artOutComboId = cmbArtnetOutputInterface.getSelectedId();
+                // -2 saved for localhost; otherwise legacy combo-1 encoding (0=All, 1=NIC0, ...)
+                es.artnetOutputInterface = (artOutComboId == 1000) ? -2 : (artOutComboId - 1);
+            }
             es.trackMapEnabled = eng.isTrackMapEnabled();
             es.midiClockEnabled = eng.isMidiClockEnabled();
             es.oscBpmForward    = eng.isOscForwardEnabled();

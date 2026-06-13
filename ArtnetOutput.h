@@ -57,7 +57,14 @@ public:
 
         destPort = targetPort;
 
-        if (interfaceIndex >= 0 && interfaceIndex < availableInterfaces.size())
+        if (interfaceIndex == -2)
+        {
+            // Loopback: send to 127.0.0.1 so receivers on the same machine see it
+            selectedInterface = -2;
+            broadcastIp = "127.0.0.1";
+            bindIp = "127.0.0.1";
+        }
+        else if (interfaceIndex >= 0 && interfaceIndex < availableInterfaces.size())
         {
             selectedInterface = interfaceIndex;
             broadcastIp = availableInterfaces[interfaceIndex].broadcast;
@@ -81,19 +88,22 @@ public:
             }
         }
 
-        // Enable SO_BROADCAST so the OS allows sending to broadcast addresses.
+        // Enable SO_BROADCAST for broadcast destinations (not needed for loopback).
         // Some systems (especially Linux) reject broadcast sends without this.
-        auto rawSock = socket->getRawSocketHandle();
-        if (rawSock >= 0)
+        if (selectedInterface != -2)
         {
-            int broadcastFlag = 1;
+            auto rawSock = socket->getRawSocketHandle();
+            if (rawSock >= 0)
+            {
+                int broadcastFlag = 1;
 #ifdef _WIN32
-            setsockopt(rawSock, SOL_SOCKET, SO_BROADCAST,
-                       (const char*)&broadcastFlag, sizeof(broadcastFlag));
+                setsockopt(rawSock, SOL_SOCKET, SO_BROADCAST,
+                           (const char*)&broadcastFlag, sizeof(broadcastFlag));
 #else
-            setsockopt(rawSock, SOL_SOCKET, SO_BROADCAST,
-                       &broadcastFlag, sizeof(broadcastFlag));
+                setsockopt(rawSock, SOL_SOCKET, SO_BROADCAST,
+                           &broadcastFlag, sizeof(broadcastFlag));
 #endif
+            }
         }
 
         isRunningFlag.store(true, std::memory_order_relaxed);
